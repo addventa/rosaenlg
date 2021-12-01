@@ -11,7 +11,7 @@ import { SpyI } from './Spy';
 
 export type SynoSeq = Map<string, number>;
 export type SynoTriggered = Map<string, number[]>;
-export type SynoMode = 'sequence' | 'random' | 'once';
+export type SynoMode = 'sequence' | 'random' | 'once' | 'first';
 
 interface RunSynzParams {
   force: number;
@@ -140,6 +140,9 @@ export class SynManager {
           return { index: this.randomManager.randomNotIn(size, params, newExclude), exclude: newExclude };
         }
       }
+      case 'first':
+        // first synonym can still get excluded if empty: return the last excluded integer + 1, starting to 1
+        return { index: (excludeParam[excludeParam.length-1] || 0) + 1, exclude: excludeParam };
       case 'random':
         return { index: this.randomManager.randomNotIn(size, params, excludeParam), exclude: excludeParam };
     }
@@ -154,7 +157,7 @@ export class SynManager {
     excludeParam: number[],
   ): void {
     const synoMode: SynoMode = params.mode || this.defaultSynoMode;
-    if (['sequence', 'random', 'once'].indexOf(synoMode) === -1) {
+    if (['sequence', 'random', 'once', 'first'].indexOf(synoMode) === -1) {
       const err = new Error();
       err.name = 'InvalidArgumentError';
       err.message = `invalid synonym mode: ${synoMode}`;
@@ -212,6 +215,12 @@ export class SynManager {
         switch (synoMode) {
           case 'random': {
             // nothing special
+            break;
+          }
+          case 'first': {
+            const triggered = this.synoTriggered.get(whichName) || [];
+            triggered.push(toTest);
+            this.synoTriggered.set(whichName, triggered);
             break;
           }
           case 'sequence': {
