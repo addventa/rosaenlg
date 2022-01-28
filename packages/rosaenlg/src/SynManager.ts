@@ -141,6 +141,9 @@ export class SynManager {
         }
       }
       case 'first':
+        // look if you don't exhaust your synonym pool
+        if( excludeParam.length >= size)
+            return { index: undefined, exclude: excludeParam };
         // first synonym can still get excluded if empty: return the last excluded integer + 1, starting to 1
         return { index: (excludeParam[excludeParam.length-1] || 0) + 1, exclude: excludeParam };
       case 'random':
