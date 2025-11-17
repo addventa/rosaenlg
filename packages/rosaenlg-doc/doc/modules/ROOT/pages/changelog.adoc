@@ -11,6 +11,8 @@ https://keepachangelog.com/en/0.3.0/
 
 === Fixed
 
+* fix for security alert: "Polynomial regular expression used on uncontrolled data" in `packages/rosaenlg-pug-code-gen/src/index.js:948` CWE-1333 / CWE-400 / CWE-730
+
 === Changed
 
 ////

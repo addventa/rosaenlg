@@ -945,9 +945,14 @@ Compiler.prototype = {
     // console.log(JSON.stringify(code));
 
     if (code.val.startsWith('setRefGender(')) {
-      const content = code.val.replace(/setRefGender\((.*)\)/, '$1');
-      // in order to be homogeneous with other expressions parsing
-      this.helper.extractWordCandidateFromSetRefGender(content);
+      const lastParenthesis = code.val.lastIndexOf(')');
+      if (lastParenthesis !== -1) {
+        // remove the setRefGender and its parentheses from the original value, without regex
+        const content = code.val.slice('setRefGender('.length, lastParenthesis) + code.val.slice(lastParenthesis + 1);
+
+        // in order to be homogeneous with other expressions parsing
+        this.helper.extractWordCandidateFromSetRefGender(content);
+      }
     }
 
     // Wrap code blocks with {}.
