@@ -1,0 +1,164 @@
+# .github/workflows/01-global-fix-trigger.yml
+name: Global Fix Trigger - Scheduled Vulnerability Scan
+
+on:
+  push:
+    branches:
+      - main
+      - codeql-advanced-configuration
+  schedule:
+    # Exécution quotidienne à 2h du matin
+    - cron: '31 19 1 * *'
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-repo-ready:
+    name: Check Repository
+    uses: ./.github/workflows/check_master_and_branch_alignment.yml
+    secrets: inherit
+    with:
+      branch: "main"
+      upstream_repo: "RosaeNLG/RosaeNLG"
+
+  codeql-scan:
+    name: CodeQL Security Scan
+    needs: check-repo-ready
+    runs-on: ubuntu-latest
+    outputs:
+      alerts-found: ${{ steps.check-alerts.outputs.found }}
+      alert-ids: ${{ steps.check-alerts.outputs.ids }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, typescript
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript"
+
+      - name: Check for alerts
+        id: check-alerts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alerts = await github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+            
+            const foundAlerts = alerts.data.length > 0;
+            const alertIds = alerts.data.map(a => a.number).join(',');
+            
+            core.setOutput('found', foundAlerts);
+            core.setOutput('ids', alertIds);
+            
+            console.log(`Found ${alerts.data.length} open alerts`);
+
+  create-fix-branches:
+    name: Create Fix Branches and Issues
+    needs: codeql-scan
+    if: needs.codeql-scan.outputs.alerts-found == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Create fix branches and issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alerts = await github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            // Keep only High or Critical severity alerts
+            alerts.data = (alerts.data || []).filter(alert =>
+              alert.rule && ['critical', 'high'].includes(String(alert.rule.severity).toLowerCase())
+            );
+
+            console.log(`Found ${alerts.data.length} open high/critical alerts`);
+
+            for (const alert of alerts.data) {
+              const branchName = `fix-codeql-alert-${alert.number}`;
+              const issueTitle = `[CodeQL] Fix vulnerability: ${alert.rule.description}`;
+              
+              // Vérifier si la branche existe déjà
+              try {
+                await github.rest.repos.getBranch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  branch: branchName
+                });
+                console.log(`Branch ${branchName} already exists, skipping...`);
+                continue;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+
+              // Créer la branche
+              const mainRef = await github.rest.git.getRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: 'heads/main'
+              });
+
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/heads/${branchName}`,
+                sha: mainRef.data.object.sha
+              });
+
+            // Créer l'issue
+            const issueBody = [
+              '## Vulnerability Details',
+              '',
+              '**Alert ID:** ' + alert.number,
+              '**Rule:** ' + alert.rule.id,
+              '**Severity:** ' + alert.rule.severity,
+              '**Description:** ' + alert.rule.description,
+              '',
+              '**Location:** ' + alert.most_recent_instance.location.path + ':' + alert.most_recent_instance.location.start_line,
+              '',
+              '**Fix Branch:** `' + branchName + '`',
+              '',
+              'This issue was automatically created by the vulnerability detection workflow.',
+              '',
+              '[View Alert](' + alert.html_url + ')'
+            ].join('\n');
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['security', 'codeql', 'automated-fix'],
+              assignees: []
+            });
+
+              console.log(`Created branch ${branchName} and issue #${issue.data.number}`);
+            }

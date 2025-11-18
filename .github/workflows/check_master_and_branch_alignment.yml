@@ -1,0 +1,40 @@
+name: Check Master And Branch Alignment (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: false
+        type: string
+        default: 'main'
+      upstream_repo:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+
+
+jobs:
+  check-master-alignment:
+    name: Check master branch vs upstream ${{ inputs.upstream_repo }}
+    uses: ./.github/workflows/check_branch_alignment_with_upstream.yml
+    secrets: inherit
+    with:
+      branch:  "master"
+      upstream_repo: ${{ inputs.upstream_repo }}
+      align: true
+
+  check-main-inclusion:
+    name: Check master and ${{ inputs.branch }} branches
+    needs: check-master-alignment
+    uses: ./.github/workflows/check_branches_inclusion.yml
+    secrets: inherit
+    with:
+      including_branch: main
+      included_branch: master
+      create_pr: false
+      auto_merge: true
