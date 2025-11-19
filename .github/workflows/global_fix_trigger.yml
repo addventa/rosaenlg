@@ -20,6 +20,7 @@ jobs:
   check-repo-ready:
     name: Check Repository
     uses: ./.github/workflows/check_master_and_branch_alignment.yml
+    if: 0
     secrets: inherit
     with:
       branch: "main"
@@ -63,13 +64,22 @@ jobs:
               per_page: 100
             });
             
+            console.log(`Found ${alerts.data.length} opened alerts`);
+
+            // Keep only High or Critical severity alerts
+            alerts.data = (alerts.data || []).filter(alert =>
+              alert.rule && ['critical', 'high'].includes(String(alert.rule.security_severity_level).toLowerCase())
+            );
+
+
             const foundAlerts = alerts.data.length > 0;
             const alertIds = alerts.data.map(a => a.number).join(',');
             
             core.setOutput('found', foundAlerts);
             core.setOutput('ids', alertIds);
             
-            console.log(`Found ${alerts.data.length} open alerts`);
+            core.setOutput('alerts', JSON.stringify(alerts.data));
+            console.log(`Found ${alerts.data.length} opened high/critical alerts`);
 
   create-fix-branches:
     name: Create Fix Branches and Issues
@@ -78,35 +88,16 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-
-      - name: Create fix branches and issues
+      - name: Check Fix Branches
         uses: actions/github-script@v7
         with:
           script: |
-            const alerts = await github.rest.codeScanning.listAlertsForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              per_page: 100
-            });
+            const alerts = JSON.parse(core.getInput('alerts'));
 
-            // Keep only High or Critical severity alerts
-            alerts.data = (alerts.data || []).filter(alert =>
-              alert.rule && ['critical', 'high'].includes(String(alert.rule.severity).toLowerCase())
-            );
-
-            console.log(`Found ${alerts.data.length} open high/critical alerts`);
-
-            for (const alert of alerts.data) {
+            for (const alert of alerts) {
               const branchName = `fix-codeql-alert-${alert.number}`;
-              const issueTitle = `[CodeQL] Fix vulnerability: ${alert.rule.description}`;
-              
-              // Vérifier si la branche existe déjà
+
+              // Check if branch exists
               try {
                 await github.rest.repos.getBranch({
                   owner: context.repo.owner,
@@ -115,11 +106,21 @@ jobs:
                 });
                 console.log(`Branch ${branchName} already exists, skipping...`);
                 continue;
-              } catch (error) {
-                if (error.status !== 404) throw error;
+              } catch (err) {
+                if (err.status !== 404) throw err;
               }
+            }
 
-              // Créer la branche
+      - name: Create Fix Branches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alerts = JSON.parse(core.getInput('alerts'));
+
+            for (const alert of alerts) {
+              const branchName = `fix-codeql-alert-${alert.number}`;
+              
+              // Create branch from main
               const mainRef = await github.rest.git.getRef({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -133,32 +134,46 @@ jobs:
                 sha: mainRef.data.object.sha
               });
 
-            // Créer l'issue
-            const issueBody = [
-              '## Vulnerability Details',
-              '',
-              '**Alert ID:** ' + alert.number,
-              '**Rule:** ' + alert.rule.id,
-              '**Severity:** ' + alert.rule.severity,
-              '**Description:** ' + alert.rule.description,
-              '',
-              '**Location:** ' + alert.most_recent_instance.location.path + ':' + alert.most_recent_instance.location.start_line,
-              '',
-              '**Fix Branch:** `' + branchName + '`',
-              '',
-              'This issue was automatically created by the vulnerability detection workflow.',
-              '',
-              '[View Alert](' + alert.html_url + ')'
-            ].join('\n');
-
-            const issue = await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: issueTitle,
-              body: issueBody,
-              labels: ['security', 'codeql', 'automated-fix'],
-              assignees: []
-            });
-
-              console.log(`Created branch ${branchName} and issue #${issue.data.number}`);
+              console.log(`Created branch ${branchName}`);
             }
+
+      - name: Create Fix Issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alerts = JSON.parse(core.getInput('alerts'));
+
+            for (const alert of alerts) {
+              const issueTitle = `[CodeQL] Fix vulnerability: ${alert.rule.description}`;
+              const branchName = `fix-codeql-alert-${alert.number}`;
+              
+              // Create issue
+              const issueBody = [
+                '## Vulnerability Details',
+                '',
+                `**Alert ID:** ${alert.number}`,
+                `**Rule:** ${alert.rule.id}`,
+                `**Severity:** ${alert.rule.severity}`,
+                `**Description:** ${alert.rule.description}`,
+                '',
+                `**Location:** ${alert.most_recent_instance.location.path}:${alert.most_recent_instance.location.start_line}`,
+                '',
+                `**Fix Branch:** \`${branchName}\``,
+                '',
+                'This issue was automatically created by the vulnerability detection workflow.',
+                '',
+                `[View Alert](${alert.html_url})`
+              ].join('\n');
+
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: issueBody,
+                labels: ['security', 'codeql', 'automated-fix']
+              });
+
+              console.log(`Created issue #${issue.data.number}`);
+            }
+        env:
+          filtered_alerts: ${{ steps.filter_alerts.outputs.filtered_alerts }}
