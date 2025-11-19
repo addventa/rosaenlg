@@ -1,0 +1,82 @@
+name: Check Branches Inclusion (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      including_branch:
+        required: true
+        type: string
+      included_branch:
+        required: true
+        type: string
+      create_pr:
+        required: false
+        type: boolean
+        default: true
+      auto_merge:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-inclusion:
+    runs-on: ubuntu-latest
+    outputs:
+      aligned: ${{ steps.check-inclusion.outputs.aligned }}
+      behind-by: ${{ steps.check-inclusion.outputs['behind-by'] }}
+      pr_exists: ${{ steps.consolidate-sync-pr.outputs.pr-exists }}
+      pr_number: ${{ steps.consolidate-sync-pr.outputs['pr-number'] }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check inclusion
+        id: check-inclusion
+        shell: bash
+        run: |
+          set -euo pipefail
+          INCLUDING=${{ inputs.including_branch }}
+          INCLUDED=${{ inputs.included_branch }}
+
+          git fetch origin "$INCLUDING"
+          git fetch origin "$INCLUDED"
+
+          INCLUDED_LATEST=$(git rev-parse remotes/origin/"$INCLUDED")
+
+          if git merge-base --is-ancestor "$INCLUDED_LATEST" remotes/origin/"$INCLUDING"; then
+            echo "aligned=true" >> $GITHUB_OUTPUT
+            echo "COMPARE_ALIGNED=true" >> $GITHUB_ENV
+            echo "behind-by=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          BASE=$(git merge-base remotes/origin/"$INCLUDING" remotes/origin/"$INCLUDED")
+          BEHIND=$(git rev-list --count "$BASE"..remotes/origin/"$INCLUDED")
+          echo "aligned=false" >> $GITHUB_OUTPUT
+          echo "COMPARE_ALIGNED=false" >> $GITHUB_ENV
+          echo "behind-by=$BEHIND" >> $GITHUB_OUTPUT
+
+      - name: Merge included branch into including branch if required
+        id: merge-included-into-including
+        if: ${{ inputs.auto_merge == true && env.COMPARE_ALIGNED == 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          INCLUDING=${{ inputs.including_branch }}
+          INCLUDED=${{ inputs.included_branch }}
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin "$INCLUDING"
+          git checkout -B "$INCLUDING" origin/"$INCLUDING"
+          git merge --no-ff --no-edit remotes/origin/"$INCLUDED"
+          git push origin "$INCLUDING"

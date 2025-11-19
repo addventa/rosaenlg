@@ -1,0 +1,72 @@
+name: Check Branch Alignment With Upstream (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+      upstream_repo:
+        required: true
+        type: string
+      align:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: write
+  issues: write
+
+jobs:
+  check-alignment:
+    runs-on: ubuntu-latest
+    outputs:
+      aligned: ${{ steps.compare-commits.outputs.aligned }}
+      behind-by: ${{ steps.compare-commits.outputs.behind-by }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add upstream remote
+        shell: bash
+        run: |
+          git fetch origin ${{ inputs.branch }}
+          git remote add upstream https://github.com/${{ inputs.upstream_repo }} || true
+          git fetch upstream ${{ inputs.branch }}
+          git branch --all
+
+      - id: compare-commits
+        name: Compare commits
+        shell: bash
+        run: |
+          BEHIND=$(git rev-list --count remotes/origin/${{ inputs.branch }}..remotes/upstream/${{ inputs.branch }})
+          echo "behind-by=$BEHIND" >> $GITHUB_OUTPUT
+
+          if [ $BEHIND -eq 0 ]; then
+            echo "aligned=true" >> $GITHUB_OUTPUT
+            echo "COMPARE_ALIGNED=true" >> $GITHUB_ENV
+            echo "${{ inputs.branch }} is aligned with upstream/${{ inputs.branch }}"
+            exit 0
+          fi
+          echo "aligned=false" >> $GITHUB_OUTPUT
+          echo "COMPARE_ALIGNED=false" >> $GITHUB_ENV
+          echo "${{ inputs.branch }} is $BEHIND commits behind upstream/${{ inputs.branch }}"
+
+      - name: Align branch
+        id: align
+        if: ${{ inputs.align == true && env.COMPARE_ALIGNED == 'false' }}
+        shell: bash
+        run: |
+          echo "Attempting to merge upstream/${{ inputs.branch }} into local ${{ inputs.branch }}..."
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          # Merge and push; fail the step on conflicts
+          git push origin remotes/upstream/${{ inputs.branch }}:refs/heads/${{ inputs.branch }} || {
+            echo "::error::Merge conflict detected. Manual intervention required."
+            exit 1
+          }
+          echo "Merged and pushed upstream/${{ inputs.branch }} -> origin/${{ inputs.branch }}"
+          
