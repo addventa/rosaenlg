@@ -20,6 +20,7 @@ permissions:
 
 jobs:
   check-master-alignment:
+    if: 0
     name: Check master branch vs upstream ${{ inputs.upstream_repo }}
     uses: ./.github/workflows/check_branch_alignment_with_upstream.yml
     secrets: inherit
@@ -29,6 +30,7 @@ jobs:
       align: true
 
   check-main-inclusion:
+    if: 0
     name: Check master and ${{ inputs.branch }} branches
     needs: check-master-alignment
     uses: ./.github/workflows/check_branches_inclusion.yml

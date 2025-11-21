@@ -1,0 +1,38 @@
+name: CodeQL Security Scan (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        description: 'Branch name to scan for alerts'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  codeql-scan:
+    name: CodeQL Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          config-file: ./.github/codeql/codeql-config.yml
+
+      #- name: Autobuild
+      #  uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:javascript"
+          wait-for-processing: true
+
