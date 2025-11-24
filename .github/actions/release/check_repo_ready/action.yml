@@ -1,0 +1,49 @@
+# .github/workflows/action_check_repo-ready.yml
+name: Action - Check Repository Ready
+description: Composite action that checks repository alignment across master/main and posts a status comment.
+
+inputs:
+  github_token:
+    description: 'GitHub token to use for API calls (pass in secrets.GITHUB_TOKEN from the caller).'
+    required: false
+
+outputs:
+  ready:
+    description: 'Overall readiness status'
+    value: ${{ steps.determine-status.outputs.ready }}
+
+runs:
+  using: composite
+  steps:
+
+    - name: Check Master Alignment
+      id: check-master
+      uses: ./.github/actions/release/check_master
+      with:
+        github_token: ${{ inputs.github_token }}
+        align: 'false'
+
+    - name: Check Main Alignment
+      id: check-main
+      uses: ./.github/actions/release/check_main
+      with:
+        github_token: ${{ inputs.github_token }}
+        auto_merge: 'true'
+
+    - name: Determine readiness
+      id: determine-status
+      if: ${{ 'false' =='true' }}
+      shell: bash
+      run: |
+        MASTER_ALIGNED="${{ steps.check-master.outputs.aligned }}"
+        MAIN_ALIGNED="${{ steps.check-main.outputs.aligned }}"
+
+        if [ "$MASTER_ALIGNED" == "true" ] && [ "$MAIN_ALIGNED" == "true" ]; then
+          echo "ready=true" >> $GITHUB_OUTPUT
+          echo "✅ Repository is ready"
+        else
+          echo "ready=false" >> $GITHUB_OUTPUT
+          echo "⚠️ Repository is not ready"
+          echo "Master aligned: $MASTER_ALIGNED"
+          echo "Main aligned: $MAIN_ALIGNED"
+        fi

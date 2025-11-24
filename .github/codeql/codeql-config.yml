@@ -1,0 +1,5 @@
+
+paths-ignore:
+ - 'packages/rosaenlg-server-toolkit/'
+ - 'packages/rosaenlg-node-server/'
+ - 'packages/rosaenlg-antora-ui/'

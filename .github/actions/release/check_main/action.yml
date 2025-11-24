@@ -1,0 +1,194 @@
+name: Check Scanned Alignment Action
+description: 'Check if the scanned branch (default: main) is up-to-date with the ref branch (default: master), create a sync PR and optionally auto-merge.'
+inputs:
+  github_token:
+    description: 'Token with repo permissions'
+    required: true
+  scanned_branch:
+    description: 'Name of the scanning branch to check (default: main)'
+    required: false
+    default: 'main'
+  ref_branch:
+    description: 'Name of the stable branch to compare (default: master)'
+    required: false
+    default: 'master'
+  create_pr:
+    description: 'If "true", create a PR when main is behind'
+    required: false
+    default: 'true'
+  auto_merge:
+    description: 'If "true", attempt to auto-merge the created PR'
+    required: false
+    default: 'false'
+outputs:
+  aligned:
+    description: 'true if scanned branch includes ref branch'
+  behind-by:
+    description: 'number of commits ref branch is ahead of scanned branch (since common ancestor)'
+  pr-exists:
+    description: 'true if a sync PR already existed'
+  pr-number:
+    description: 'PR number if created or existing'
+runs:
+  using: 'composite'
+  steps:
+    - name: Check alignment
+      id: check
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        git fetch origin ${{ inputs.scanned_branch }}
+        git fetch origin ${{ inputs.ref_branch}}
+
+        REF_LATEST=$(git rev-parse remotes/origin/${{ inputs.ref_branch}})
+        echo $REF_LATEST
+        
+        if git merge-base --is-ancestor $REF_LATEST remotes/origin/${{ inputs.scanned_branch }};then echo ok;else echo 'not ok';fi
+
+        if git merge-base --is-ancestor $REF_LATEST remotes/origin/${{ inputs.scanned_branch }}; then
+          echo "aligned=true" >> $GITHUB_OUTPUT
+          echo "COMPARE_ALIGNED=true" >> $GITHUB_ENV
+          echo "behind-by=0" >> $GITHUB_OUTPUT
+          echo "Scanned branch (${{ inputs.scanned_branch }}) includes ref branch (${{ inputs.ref_branch}})"
+          exit 0
+        fi
+        echo "set up end"
+        BASE=$(git merge-base remotes/origin/${{ inputs.scanned_branch }} remotes/origin/${{ inputs.ref_branch}})
+        echo "BASE end"
+        BEHIND=$(git rev-list --count "$BASE"..remotes/origin/${{ inputs.ref_branch}})
+        echo "BEHIND end"
+        echo "aligned=false" >> $GITHUB_OUTPUT
+        echo "COMPARE_ALIGNED=false" >> $GITHUB_ENV
+        echo "behind-by=$BEHIND" >> $GITHUB_OUTPUT
+        echo "Scanned branch (${{ inputs.scanned_branch }}) is $BEHIND commits behind ref branch (${{ inputs.ref_branch}})"
+
+    - name: Merge ref into scanned branch if required
+      id: merge_ref
+      if: ${{ inputs.auto_merge == 'true' && env.COMPARE_ALIGNED == 'false' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        git checkout remotes/origin/${{ inputs.scanned_branch }}
+        git merge --no-ff --no-edit remotes/origin/${{ inputs.ref_branch}}
+        git push origin ${{ inputs.scanned_branch }}
+
+    - name: Check for existing sync PR
+      id: check_pr
+      if: ${{ inputs.auto_merge == 'true' && env.COMPARE_ALIGNED == 'false' }}
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const scanned = process.env.SCANNED_BRANCH;
+          const ref = process.env.REF_BRANCH;
+          const prs = await github.rest.pulls.list({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            head: `${context.repo.owner}:${ref}`,
+            base: scanned,
+            state: 'open'
+          });
+          if (prs.data.length > 0) {
+            core.setOutput('exists', 'true');
+            core.setOutput('pr-number', String(prs.data[0].number));
+            core.setOutput('created', 'false');
+            console.log(`Existing sync PR #${prs.data[0].number}`);
+          } else {
+            core.setOutput('exists', 'false');
+          }
+      env:
+        SCANNED_BRANCH: ${{ inputs.scanned_branch }}
+        REF_BRANCH: ${{ inputs.ref_branch }}
+
+    - name: Create sync PR if needed
+      id: create_pr
+      if: ${{ inputs.auto_merge == 'true' && env.COMPARE_ALIGNED == 'false' && steps.check_pr.outputs.exists == 'false' && inputs.create_pr == 'true' }}
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const scanned = process.env.SCANNED_BRANCH;
+          const ref = process.env.REF_BRANCH;
+          const pr = await github.rest.pulls.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: '🔄 Sync scanned with ref',
+            head: ref,
+            base: scanned,
+            body: `Automated sync: update ${scanned} with ${ref}`
+          });
+          core.setOutput('created', 'true');
+          core.setOutput('pr-number', String(pr.data.number));
+          core.setOutput('exists', 'true');
+          console.log(`Created PR #${pr.data.number}`);
+      env:
+        SCANNED_BRANCH: ${{ inputs.scanned_branch }}
+        REF_BRANCH: ${{ inputs.ref_branch }}
+
+    - name: Auto-merge sync PR when requested
+      id: auto_merge_pr
+      if: ${{ inputs.auto_merge == 'true' && env.COMPARE_ALIGNED == 'false' && (steps.check_pr.outputs.exists == 'true' || steps.create_pr.outputs.created == 'true') }}
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const scanned = process.env.SCANNED_BRANCH;
+          const ref = process.env.REF_BRANCH;
+          // Determine PR number: prefer the one created in this run, otherwise the existing one
+          const createdPrNumber = process.env.CREATED_PR_NUMBER || '';
+          const existingPrNumber = process.env.EXISTING_PR_NUMBER || '';
+          const prNumber = createdPrNumber || existingPrNumber;
+          if (!prNumber) {
+            console.log('No PR to merge');
+            return;
+          }
+          try {
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number(prNumber),
+              merge_method: 'merge'
+            });
+            console.log(`Auto-merged PR #${prNumber}`);
+          } catch (e) {
+            console.log(`Auto-merge failed for PR #${prNumber}: ${e.message}`);
+            core.setFailed('Auto-merge failed');
+          }
+      env:
+        CREATED_PR_NUMBER: ${{ steps.create_pr.outputs['pr-number'] }}
+        EXISTING_PR_NUMBER: ${{ steps.check_pr.outputs['pr-number'] }}
+        SCANNED_BRANCH: ${{ inputs.scanned_branch }}
+        REF_BRANCH: ${{ inputs.ref_branch }}
+
+    - name: Consolidate PR outputs for composite action
+      id: consolidate_pr
+      if: ${{ inputs.auto_merge == 'true' && env.COMPARE_ALIGNED == 'false' }}
+      shell: bash
+      run: |
+        CHECK_EXISTS="${{ steps.check_pr.outputs.exists }}"
+        CHECK_PR_NUMBER="${{ steps.check_pr.outputs['pr-number'] }}"
+        CREATED_EXISTS="${{ steps.create_pr.outputs.exists }}"
+        CREATED_PR_NUMBER="${{ steps.create_pr.outputs['pr-number'] }}"
+
+        # Determine final pr existence and number
+        PR_EXISTS="false"
+        if [ "${CREATED_EXISTS}" = "true" ] || [ "${CHECK_EXISTS}" = "true" ]; then
+          PR_EXISTS="true"
+        fi
+
+        PR_NUMBER="${CREATED_PR_NUMBER}"
+        if [ -z "${PR_NUMBER}" ]; then
+          PR_NUMBER="${CHECK_PR_NUMBER}"
+        fi
+
+        echo "pr-exists=${PR_EXISTS}" >> $GITHUB_OUTPUT
+        echo "pr-number=${PR_NUMBER}" >> $GITHUB_OUTPUT
+
+        # map check outputs to composite outputs
+        echo "aligned=${{ steps.check.outputs.aligned }}" >> $GITHUB_OUTPUT
+        echo "behind-by=${{ steps.check.outputs['behind-by'] }}" >> $GITHUB_OUTPUT

@@ -1,0 +1,66 @@
+# .github/workflows/01-global-fix-trigger.yml
+name: Global Fix Trigger - Scheduled Vulnerability Scan
+
+on:
+  push:
+    branches:
+      - main
+      - codeql-advanced-configuration
+  schedule:
+    # Exécution quotidienne à 2h du matin
+    - cron: '31 19 1 * *'
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+  actions: read
+  packages: read
+
+jobs:
+  setup:
+    name: Setup Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      target-branch: ${{ steps.config.outputs.branch }}
+      severity: ${{ steps.config.outputs.severity }}
+    steps:
+      - name: Set Configuration
+        id: config
+        run: |
+          # Change this line to set your desired branch
+          TARGET_BRANCH="${{ github.ref_name }}"
+          echo "branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+          
+          # Change this line to set severity filter (affects CodeQL query pack selection)
+          SEVERITY="high,critical"
+          echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+
+  check-repo-ready:
+    name: Check Repository
+    needs: setup
+    uses: ./.github/workflows/check_master_and_branch_alignment.yml
+    secrets: inherit
+    with:
+      branch: ${{ needs.setup.outputs.target-branch }}
+      upstream_repo: "RosaeNLG/RosaeNLG"
+
+  codeql-scan:
+    name: CodeQL Security Scan
+    needs: setup
+    #needs: check-repo-ready
+    uses: ./.github/workflows/codeql_branch_scan.yml
+    secrets: inherit
+    with:
+      branch: ${{ needs.setup.outputs.target-branch }}
+      severity: ${{ needs.setup.outputs.severity }}
+
+  create-fix-branches:
+    name: Create Fix Branches and Issues
+    needs: [setup, codeql-scan]
+    uses: ./.github/workflows/create_fix_branches.yml
+    secrets: inherit
+    with:
+      branch: ${{ needs.setup.outputs.target-branch }}
+      severity: ${{ needs.setup.outputs.severity }}

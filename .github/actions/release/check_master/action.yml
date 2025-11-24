@@ -1,0 +1,85 @@
+name: Check Master Alignment
+description: 'Check if local branch (default: master) is aligned with upstream and optionally merge upstream into local and push.'
+inputs:
+  github_token:
+    description: 'Token with push permissions'
+    required: true
+  ref:
+    description: 'Branch to check (branch name only, default: master)'
+    required: false
+    default: 'master'
+  upstream_repo:
+    description: 'Upstream repo in owner/repo form (default: RosaeNLG/RosaeNLG)'
+    required: false
+    default: 'RosaeNLG/RosaeNLG'
+  align:
+    description: 'If "true", attempt to merge upstream into local and push when out-of-date'
+    required: false
+    default: 'false'
+outputs:
+  aligned:
+    description: 'true if local branch equals upstream branch'
+  behind-by:
+    description: 'number of commits upstream is ahead of local'
+runs:
+  using: 'composite'
+  steps:
+    - name: Add upstream remote
+      shell: bash
+      run: |
+        git fetch origin ${{ inputs.ref }}
+        git remote add upstream https://github.com/${{ inputs.upstream_repo }} || true
+        git fetch upstream ${{ inputs.ref }}
+        git branch --all
+        
+    - id: get-local-commit
+      name: Get local commit hash
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "LOCAL_COMMIT=$(git rev-parse remotes/origin/${{ inputs.ref }})" >> $GITHUB_ENV
+
+    - id: get-upstream-commit
+      name: Get upstream commit hash
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "UPSTREAM_COMMIT=$(git rev-parse remotes/upstream/${{ inputs.ref }})" >> $GITHUB_ENV
+
+    - id: compare-commits
+      name: Compare commits
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+          echo "aligned=true" >> $GITHUB_OUTPUT
+          echo "COMPARE_ALIGNED=true" >> $GITHUB_ENV
+          echo "behind-by=0" >> $GITHUB_OUTPUT
+          echo "Master is aligned with upstream/${{ inputs.ref }}"
+          exit 0
+        fi
+
+        BEHIND=$(git rev-list --count remotes/origin/${{ inputs.ref }}..remotes/upstream/${{ inputs.ref }})
+        echo "aligned=false" >> $GITHUB_OUTPUT
+        echo "COMPARE_ALIGNED=false" >> $GITHUB_ENV
+        echo "behind-by=$BEHIND" >> $GITHUB_OUTPUT
+        echo "Master is $BEHIND commits behind upstream/${{ inputs.ref }}"
+
+    - id: align
+      name: Optionally align
+      if: ${{ inputs.align == 'true' && env.COMPARE_ALIGNED == 'false' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "Attempting to merge upstream/${{ inputs.ref }} into local ${{ inputs.ref }}..."
+        git config user.name "addventa-github-actions[bot]"
+        git config user.email "addventa-github-actions[bot]@addventa.com"
+
+        # Merge and push; fail the step on conflicts
+        git push origin remotes/upstream/${{ inputs.ref }}:refs/heads/${{ inputs.ref }} || {
+          echo "::error::Merge conflict detected. Manual intervention required."
+          exit 1
+        }
+        echo "Merged and pushed upstream/${{ inputs.ref }} -> origin/${{ inputs.ref }}"
