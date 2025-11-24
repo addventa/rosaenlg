@@ -8,6 +8,11 @@ on:
         required: true
         type: string
         description: 'Branch name to scan'
+      severity:
+        required: false
+        type: string
+        description: 'Severity filter - affects which query packs are used (high/critical = security-extended, all = security-and-quality)'
+        default: 'high,critical'
 
 jobs:
   analyze:
@@ -42,11 +47,22 @@ jobs:
       with:
         ref: ${{ inputs.branch }}
 
-    # Add any setup steps before running the `github/codeql-action/init` action.
-    # This includes steps like installing compilers or runtimes (`actions/setup-node`
-    # or others). This is typically only required for manual builds.
-    # - name: Setup runtime (example)
-    #   uses: actions/setup-example@v1
+    # Determine which query pack to use based on severity filter
+    # This speeds up analysis by running fewer queries for high/critical severity scans
+    - name: Determine Query Pack
+      id: query-pack
+      run: |
+        SEVERITY="${{ inputs.severity }}"
+        if [[ "$SEVERITY" == "high,critical" ]] || [[ "$SEVERITY" == "critical" ]] || [[ "$SEVERITY" == "high" ]]; then
+          # Use security-extended for high/critical - faster, focuses on security issues
+          QUERY_PACK="security-extended"
+          echo "Using security-extended query pack (faster, security-focused)"
+        else
+          # Use security-and-quality for all severities - more comprehensive
+          QUERY_PACK="security-and-quality"
+          echo "Using security-and-quality query pack (comprehensive)"
+        fi
+        echo "query-pack=$QUERY_PACK" >> $GITHUB_OUTPUT
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
@@ -55,12 +71,10 @@ jobs:
         languages: javascript-typescript
         build-mode: none
         config-file: ./.github/codeql/codeql-config.yml
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
-
-        # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
-        # queries: security-extended,security-and-quality
+        # Use query packs based on severity filter to speed up analysis
+        # security-extended: Faster, focuses on security issues (typically high/critical severity)
+        # security-and-quality: Slower, includes quality issues (all severities)
+        queries: ${{ steps.query-pack.outputs.query-pack }}
 
     # If the analyze step fails for one of the languages you are analyzing with
     # "We were unable to automatically build your code", modify the matrix above

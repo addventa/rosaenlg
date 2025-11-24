@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       target-branch: ${{ steps.config.outputs.branch }}
+      severity: ${{ steps.config.outputs.severity }}
     steps:
       - name: Set Configuration
         id: config
@@ -31,6 +32,10 @@ jobs:
           # Change this line to set your desired branch
           TARGET_BRANCH="${{ github.ref_name }}"
           echo "branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
+          
+          # Change this line to set severity filter (affects CodeQL query pack selection)
+          SEVERITY="high,critical"
+          echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
 
   check-repo-ready:
     name: Check Repository
@@ -49,6 +54,7 @@ jobs:
     secrets: inherit
     with:
       branch: ${{ needs.setup.outputs.target-branch }}
+      severity: ${{ needs.setup.outputs.severity }}
 
   create-fix-branches:
     name: Create Fix Branches and Issues
@@ -57,4 +63,4 @@ jobs:
     secrets: inherit
     with:
       branch: ${{ needs.setup.outputs.target-branch }}
-      severity: "high,critical"
+      severity: ${{ needs.setup.outputs.severity }}
