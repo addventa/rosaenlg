@@ -13,7 +13,7 @@ on:
         description: 'Severity level(s) to filter (e.g., "high,critical" or "critical")'
 
 permissions:
-  contents: read
+  contents: write  # Required to create branches
   security-events: read
   issues: write
   pull-requests: write

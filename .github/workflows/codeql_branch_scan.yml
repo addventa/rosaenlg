@@ -24,7 +24,7 @@ jobs:
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
     runs-on: ubuntu-latest
     permissions:
-      # required for all workflows
+      # required for all workflows (write includes read)
       security-events: write
 
       # required to fetch internal or private CodeQL packs
@@ -71,10 +71,6 @@ jobs:
         languages: javascript-typescript
         build-mode: none
         config-file: ./.github/codeql/codeql-config.yml
-        # Use query packs based on severity filter to speed up analysis
-        # security-extended: Faster, focuses on security issues (typically high/critical severity)
-        # security-and-quality: Slower, includes quality issues (all severities)
-        queries: ${{ steps.query-pack.outputs.query-pack }}
 
     # If the analyze step fails for one of the languages you are analyzing with
     # "We were unable to automatically build your code", modify the matrix above
@@ -87,3 +83,45 @@ jobs:
       with:
         category: "/language:javascript-typescript"
         wait-for-processing: true
+
+    - name: Log Found Alerts
+      id: log-found-alerts
+      if: 1
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const branchRef = `refs/heads/${{ inputs.branch }}`;
+          
+          // First: Fetch ALL alerts (no severity filter) to see total count
+          console.log(`Fetching all alerts on branch ${{ inputs.branch }}...`);
+          const allAlertsResponse = await github.rest.codeScanning.listAlertsForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            ref: branchRef,
+            per_page: 100
+          });
+          
+          const allAlerts = allAlertsResponse.data || [];
+          console.log(`Found ${allAlerts.length} total opened alerts on branch ${{ inputs.branch }}`);
+
+          // Second: Filter alerts by specific severity levels from the already-fetched alerts
+          const severityInput = '${{ inputs.severity }}';
+          const severityLevels = severityInput.split(',').map(s => s.trim().toLowerCase());
+          console.log(`Filtering for severities: ${severityLevels.join(', ')} on branch ${{ inputs.branch }}`);
+          
+          // Filter alerts by severity (check both rule.severity and rule.security_severity_level)
+          const filteredAlerts = allAlerts.filter(alert => {
+            const alertSeverity = (alert.rule?.security_severity_level || '').toLowerCase();
+            return severityLevels.includes(alertSeverity);
+          });
+
+          // Deduplicate alerts by alert number (shouldn't be necessary, but keeping for safety)
+          const uniqueAlerts = Array.from(
+            new Map(filteredAlerts.map(alert => [alert.number, alert])).values()
+          );
+
+          console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
+
+          // Store filtered alerts for subsequent steps
+          core.setOutput('alerts', JSON.stringify(uniqueAlerts));

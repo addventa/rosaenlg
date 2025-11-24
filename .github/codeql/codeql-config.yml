@@ -1,5 +1,15 @@
+name: "CodeQL config file"
 
 paths-ignore:
- - 'packages/rosaenlg-server-toolkit/'
- - 'packages/rosaenlg-node-server/'
- - 'packages/rosaenlg-antora-ui/'
+  - 'packages/rosaenlg-server-toolkit/'
+  - 'packages/rosaenlg-node-server/'
+  - 'packages/rosaenlg-antora-ui/'
+  - 'packages/browser-ide-demo/'
+  - 'packages/rosaenlg-yseop/'
+  - 'packages/generator-rosaenlg/'
+
+#query-filters:
+#  - exclude:
+#    id: js/redundant-assignment
+#  - exclude:
+#    id: js/useless-assignment-to-local
