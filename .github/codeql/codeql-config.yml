@@ -3,3 +3,6 @@ paths-ignore:
  - 'packages/rosaenlg-server-toolkit/'
  - 'packages/rosaenlg-node-server/'
  - 'packages/rosaenlg-antora-ui/'
+ - 'packages/browser-ide-demo/'
+ - 'packages/rosaenlg-yseop/'
+ - 'packages/generator-rosaenlg/'

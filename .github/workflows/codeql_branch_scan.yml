@@ -87,3 +87,43 @@ jobs:
       with:
         category: "/language:javascript-typescript"
         wait-for-processing: true
+
+    - name: Log Found Alerts
+      id: log-found-alerts
+      if: 1
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const branchRef = `refs/heads/${{ inputs.branch }}`;
+          const severityInput = '${{ inputs.severity }}';
+          
+          // Parse severity levels (support comma-separated values)
+          const severityLevels = severityInput.split(',').map(s => s.trim().toLowerCase());
+          console.log(`Scanning for severities: ${severityLevels.join(', ')} on branch ${{ inputs.branch }}`);
+          
+          // Fetch alerts for each severity level in parallel
+          const alertPromises = severityLevels.map(severity =>
+            github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              severity: severity,
+              ref: branchRef,
+              per_page: 100
+            })
+          );
+          
+          const alertResponses = await Promise.all(alertPromises);
+          
+          // Combine all alerts from different severity levels
+          const allImportantAlerts = alertResponses.flatMap(response => response.data || []);
+          
+          // Deduplicate alerts by alert number
+          const uniqueAlerts = Array.from(
+            new Map(allImportantAlerts.map(alert => [alert.number, alert])).values()
+          );
+          
+          console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
+          
+          // Store alerts for subsequent steps
+          core.setOutput('alerts', JSON.stringify(uniqueAlerts));
