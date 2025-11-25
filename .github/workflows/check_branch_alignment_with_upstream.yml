@@ -62,7 +62,7 @@ jobs:
         run: |
           echo "Attempting to merge upstream/${{ inputs.branch }} into local ${{ inputs.branch }}..."
           git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          git config user.email "${{ github.actor }}@addventa.com"
           # Merge and push; fail the step on conflicts
           git push origin remotes/upstream/${{ inputs.branch }}:refs/heads/${{ inputs.branch }} || {
             echo "::error::Merge conflict detected. Manual intervention required."

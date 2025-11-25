@@ -70,8 +70,8 @@ runs:
       run: |
         set -euo pipefail
 
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git config user.name "addventa-github-actions[bot]"
+        git config user.email "addventa-github-actions[bot]@addventa.com"
 
         git checkout remotes/origin/${{ inputs.scanned_branch }}
         git merge --no-ff --no-edit remotes/origin/${{ inputs.ref_branch}}

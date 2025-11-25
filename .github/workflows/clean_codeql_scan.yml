@@ -1,0 +1,253 @@
+# .github/workflows/05-internal-release.yml
+name: Internal Release Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_version:
+        description: 'Base version (X.Y.Z)'
+        required: true
+        type: string
+      revision_number:
+        description: 'Revision number (N)'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-all-vulnerabilities-closed:
+    name: Check All Vulnerabilities Closed
+    runs-on: ubuntu-latest
+    outputs:
+      all-closed: ${{ steps.check.outputs.all-closed }}
+      open-count: ${{ steps.check.outputs.open-count }}
+    
+    steps:
+      - name: Check open CodeQL issues
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql'
+            });
+
+            const openCount = issues.data.length;
+            const allClosed = openCount === 0;
+
+            core.setOutput('all-closed', allClosed);
+            core.setOutput('open-count', openCount);
+
+            if (!allClosed) {
+              core.warning(`Found ${openCount} open vulnerability issues`);
+            }
+
+  merge-fix-branches:
+    name: Merge Fix Branches
+    if: needs.check-all-vulnerabilities-closed.outputs.all-closed == 'true'
+    needs: [check-all-vulnerabilities-closed]
+    runs-on: ubuntu-latest
+    outputs:
+      release-branch: ${{ steps.create-branch.outputs.branch-name }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Create release branch
+        id: create-branch
+        run: |
+          RELEASE_BRANCH="v${{ inputs.base_version }}-r${{ inputs.revision_number }}"
+          echo "branch-name=${RELEASE_BRANCH}" >> $GITHUB_OUTPUT
+          
+          git config user.name "addventa-github-actions[bot]"
+          git config user.email "addventa-github-actions[bot]@addventa.com"
+          
+          git checkout -b "${RELEASE_BRANCH}"
+          git push origin "${RELEASE_BRANCH}"
+
+      - name: Get closed fix branches
+        id: get-branches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
+              labels: 'codeql,resolved',
+              per_page: 100
+            });
+
+            const branches = [];
+            for (const issue of issues.data) {
+              const branchMatch = issue.body.match(/\*\*Fix Branch:\*\* `([^`]+)`/);
+              if (branchMatch) {
+                branches.push(branchMatch[1]);
+              }
+            }
+
+            return branches;
+
+      - name: Merge fix branches
+        run: |
+          RELEASE_BRANCH="v${{ inputs.base_version }}-r${{ inputs.revision_number }}"
+          git checkout "${RELEASE_BRANCH}"
+          
+          # Récupérer la liste des branches depuis l'étape précédente
+          BRANCHES='${{ steps.get-branches.outputs.result }}'
+          
+          echo "Merging fix branches into ${RELEASE_BRANCH}..."
+          
+          for branch in $(echo "${BRANCHES}" | jq -r '.[]'); do
+            echo "Merging ${branch}..."
+            git merge "origin/${branch}" --no-ff -m "Merge ${branch} into ${RELEASE_BRANCH}" || {
+              echo "Conflict merging ${branch}, manual intervention required"
+              exit 1
+            }
+          done
+          
+          git push origin "${RELEASE_BRANCH}"
+
+  verify-release-codeql:
+    name: Verify Release with CodeQL
+    needs: merge-fix-branches
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.merge-fix-branches.outputs.release-branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, typescript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Check for vulnerabilities
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alerts = await github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              ref: `refs/heads/${{ needs.merge-fix-branches.outputs.release-branch }}`
+            });
+
+            if (alerts.data.length > 0) {
+              core.setFailed(`Found ${alerts.data.length} vulnerabilities in release branch`);
+              
+              // Créer une issue pour signaler le problème
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `⚠️ Vulnerabilities found in release branch ${context.ref}`,
+                body: `Found ${alerts.data.length} open vulnerabilities in the release branch.`,
+                labels: ['security', 'release-blocker']
+              });
+            }
+
+  create-release:
+    name: Create Internal Release
+    needs: [merge-fix-branches, verify-release-codeql]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.merge-fix-branches.outputs.release-branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Update package version
+        run: |
+          RELEASE_VERSION="${{ inputs.base_version }}-r${{ inputs.revision_number }}"
+          npm version "${RELEASE_VERSION}" --no-git-tag-version
+          
+          git config user.name "addventa-github-actions[bot]"
+          git config user.email "addventa-github-actions[bot]@addventa.com"
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to ${RELEASE_VERSION}"
+          git push
+
+      - name: Build release
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Create GitHub Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ inputs.base_version }}-r${{ inputs.revision_number }}';
+            const releaseBranch = '${{ needs.merge-fix-branches.outputs.release-branch }}';
+            
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${version}`,
+              target_commitish: releaseBranch,
+              name: `Internal Release v${version}`,
+              body: `## Internal Release ${version}
+              
+This is an internal release with security fixes.
+
+**Security Fixes:**
+- All known CodeQL vulnerabilities resolved
+- Branch: \`${releaseBranch}\`
+
+**Changes:**
+See merged fix branches for details.`,
+              draft: false,
+              prerelease: false
+            });
+
+            console.log(`Created release: ${release.data.html_url}`);
+
+      - name: Notify success
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ inputs.base_version }}-r${{ inputs.revision_number }}';
+            
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: `✅ Internal release v${version} created successfully!`
+            });

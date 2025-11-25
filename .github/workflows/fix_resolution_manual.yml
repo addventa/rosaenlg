@@ -1,0 +1,155 @@
+# .github/workflows/03-fix-resolution-manual.yml
+name: Fix Resolution - Manual Verification
+
+on:
+  push:
+    branches:
+      - 'fix-codeql-alert-[0-9]+'
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  verify-fix:
+    name: Verify Manual Fix
+    runs-on: ubuntu-latest
+    outputs:
+      resolved: ${{ steps.check-resolved.outputs.resolved }}
+      branch-name: ${{ steps.extract-alert.outputs.branch-name }}
+    
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, typescript
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Extract alert ID from branch
+        id: extract-alert
+        run: |
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          ALERT_ID="${BRANCH_NAME#fix-codeql-alert-}"
+          echo "alert-id=${ALERT_ID}" >> $GITHUB_OUTPUT
+          echo "branch-name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Check if vulnerability resolved
+        id: check-resolved
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alertId = ${{ steps.extract-alert.outputs.alert-id }};
+            
+            const alert = await github.rest.codeScanning.getAlert({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              alert_number: alertId
+            });
+            
+            const resolved = alert.data.state === 'fixed' || alert.data.state === 'dismissed';
+            core.setOutput('resolved', resolved);
+            
+      - name: Alert if still vulnerable
+        if: steps.check-resolved.outputs.resolved != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branchName = '${{ steps.extract-alert.outputs.branch-name }}';
+            
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql'
+            });
+
+            for (const issue of issues.data) {
+              if (issue.body && issue.body.includes(`\`${branchName}\``)) {
+                const issueBody = [
+                  '⚠️ Changes pushed but vulnerability still present. Please review the fix.',
+                  '',
+                  `Commit: ${context.sha}`
+                ].join('\n');
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: issueBody.join('\n')
+                });
+                break;
+              }
+            }
+            
+            core.setFailed('Vulnerability still present after manual fix');
+
+  build-and-test:
+    name: Build and Test
+    needs: verify-fix
+    if: needs.verify-fix.outputs.resolved == 'true'
+    uses: ./.github/workflows/build_and_test.yml
+    with:
+      node-version: '20'
+      fetch-depth: '0'
+
+  find-and-close-issue:
+    name: Find and Close Related Issue
+    needs: [verify-fix, build-and-test]
+    if: needs.verify-fix.outputs.resolved == 'true'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Find and close related issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branchName = '${{ needs.verify-fix.outputs.branch-name }}';
+            
+            // Rechercher l'issue liée
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql'
+            });
+
+            for (const issue of issues.data) {
+              if (issue.body && issue.body.includes(`\`${branchName}\``)) {
+              
+                const issueBody = [
+                  '✅ Manual fix verified successfully. Vulnerability resolved. Fix is pending release.',
+                  '',
+                  `Commit: ${context.sha}`
+                ].join('\n');
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: issueBody.join('\n')
+                });
+
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  labels: ['security', 'codeql', 'manual-fix', 'pending']
+                });
+
+                console.log(`Updated issue #${issue.number} to pending status`);
+                break;
+              }
+            }

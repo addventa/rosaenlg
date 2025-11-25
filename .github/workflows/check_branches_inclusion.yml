@@ -73,8 +73,8 @@ jobs:
           INCLUDING=${{ inputs.including_branch }}
           INCLUDED=${{ inputs.included_branch }}
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "addventa-github-actions[bot]"
+          git config user.email "addventa-github-actions[bot]@addventa.com"
 
           git fetch origin "$INCLUDING"
           git checkout -B "$INCLUDING" origin/"$INCLUDING"

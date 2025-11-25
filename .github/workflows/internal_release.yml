@@ -1,0 +1,382 @@
+# .github/workflows/05-internal-release.yml
+name: Internal Release Production
+
+on:
+  workflow_run:
+    workflows: ["Fix Resolution - Manual Verification", "Fix Resolution - Automated"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-trigger:
+    name: Check Trigger Condition
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.check.outputs.should-run }}
+      base-version: ${{ steps.version.outputs.base-version }}
+      revision-number: ${{ steps.version.outputs.revision-number }}
+    
+    steps:
+      - name: Check if should run
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Triggered by fix_resolution_manual.yml or fix_resolution_auto.yml completion
+            const workflowRun = context.payload.workflow_run;
+            let shouldRun = false;
+            
+            // Only proceed if the triggering workflow completed successfully
+            if (workflowRun.conclusion === 'success') {
+              console.log(`Triggered by workflow: ${workflowRun.name} (${workflowRun.html_url})`);
+              
+              // Check if there are any pending CodeQL issues
+              const issues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'codeql,pending',
+                per_page: 1
+              });
+              
+              shouldRun = issues.data.length > 0;
+              
+              if (shouldRun) {
+                console.log(`Found pending CodeQL issue(s).`);
+              } else {
+                console.log('No pending CodeQL issues found. Skipping release.');
+              }
+            } else {
+              console.log(`Triggering workflow completed with status: ${workflowRun.conclusion}. Skipping release.`);
+            }
+            
+            core.setOutput('should-run', shouldRun);
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+
+      - name: Determine version from package.json
+        id: version
+        run: |
+          if [ -f "package.json" ]; then
+            # Extract base version from package.json
+            CURRENT_VERSION=$(node -p "require('./package.json').version")
+            BASE_VERSION=$(echo "$CURRENT_VERSION" | sed -E 's/-r[0-9]+$//' | sed -E 's/-.*$//')
+            
+            # Get latest revision number from git tags
+            git fetch --tags --depth=10 2>/dev/null || true
+            LATEST_TAG=$(git tag -l "v${BASE_VERSION}-r*" | sort -V | tail -1)
+            
+            if [ -n "$LATEST_TAG" ]; then
+              REVISION_NUMBER=$(echo "$LATEST_TAG" | sed -E 's/.*-r([0-9]+)$/\1/' | awk '{print $1+1}')
+            else
+              REVISION_NUMBER="1"
+            fi
+          else
+            echo "Error: package.json not found"
+            exit 1
+          fi
+          
+          echo "base-version=${BASE_VERSION}" >> $GITHUB_OUTPUT
+          echo "revision-number=${REVISION_NUMBER}" >> $GITHUB_OUTPUT
+          echo "Using version: ${BASE_VERSION}-r${REVISION_NUMBER}"
+
+  check-pending-fixes:
+    name: Check Pending Fixes
+    needs: [check-trigger]
+    if: needs.check-trigger.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      has-pending: ${{ steps.check.outputs.has-pending }}
+      has-blocking: ${{ steps.check.outputs.has-blocking }}
+    
+    steps:
+      - name: Check pending and blocking issues
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql'
+            });
+
+            // Separate pending issues (verified fixes) from blocking issues
+            const pendingIssues = issues.data.filter(issue => {
+              const labels = issue.labels.map(l => l.name);
+              return labels.includes('pending');
+            });
+            
+            console.log(`Found ${issues.data.length} opened vulnerability issues`);
+            console.log(`Found ${pendingIssues.length} pending issues (verified fixes ready for release)`);
+
+            const hasPending = pendingIssues.length > 0;
+            const hasBlocking = (issues.data.length - pendingIssues.length) > 0;
+
+            core.setOutput('has-pending', hasPending);
+            core.setOutput('has-blocking', hasBlocking);
+
+
+  merge-fix-branches:
+    name: Merge Fix Branches
+    if: needs.check-pending-fixes.outputs.has-blocking != 'true'
+    needs: [check-trigger, check-pending-fixes]
+    runs-on: ubuntu-latest
+    outputs:
+      release-branch: ${{ steps.create-branch.outputs.branch-name }}
+      base-version: ${{ needs.check-trigger.outputs.base-version }}
+      revision-number: ${{ needs.check-trigger.outputs.revision-number }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Create release branch
+        id: create-branch
+        run: |
+          RELEASE_BRANCH="v${{ needs.check-trigger.outputs.base-version }}-r${{ needs.check-trigger.outputs.revision-number }}"
+          echo "branch-name=${RELEASE_BRANCH}" >> $GITHUB_OUTPUT
+          
+          git config user.name "addventa-github-actions[bot]"
+          git config user.email "addventa-github-actions[bot]@addventa.com"
+          
+          git checkout -b "${RELEASE_BRANCH}"
+          git push origin "${RELEASE_BRANCH}"
+
+      - name: Get pending fix branches
+        id: get-branches
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get pending issues (verified fixes waiting for release)
+            const pendingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql,pending',
+              per_page: 100
+            });
+
+            const branches = [];
+            for (const issue of pendingIssues.data) {
+              const branchMatch = issue.body.match(/\*\*Fix Branch:\*\* `([^`]+)`/);
+              if (branchMatch) {
+                branches.push(branchMatch[1]);
+              }
+            }
+
+            console.log(`Found ${branches.length} pending fix branches to merge`);
+
+            return branches;
+
+      - name: Merge fix branches
+        run: |
+          RELEASE_BRANCH="v${{ needs.check-trigger.outputs.base-version }}-r${{ needs.check-trigger.outputs.revision-number }}"
+          git checkout "${RELEASE_BRANCH}"
+          
+          # Récupérer la liste des branches depuis l'étape précédente
+          BRANCHES='${{ steps.get-branches.outputs.result }}'
+          
+          echo "Merging fix branches into ${RELEASE_BRANCH}..."
+          
+          for branch in $(echo "${BRANCHES}" | jq -r '.[]'); do
+            echo "Merging ${branch}..."
+            git merge "origin/${branch}" --no-ff -m "Merge ${branch} into ${RELEASE_BRANCH}" || {
+              echo "Conflict merging ${branch}, manual intervention required"
+              exit 1
+            }
+          done
+          
+          git push origin "${RELEASE_BRANCH}"
+
+  verify-release-codeql:
+    name: Verify Release with CodeQL
+    needs: merge-fix-branches
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.merge-fix-branches.outputs.release-branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, typescript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Check for vulnerabilities
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alerts = await github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              ref: `refs/heads/${{ needs.merge-fix-branches.outputs.release-branch }}`
+            });
+
+            if (alerts.data.length > 0) {
+              core.setFailed(`Found ${alerts.data.length} vulnerabilities in release branch`);
+              
+              // Créer une issue pour signaler le problème
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `⚠️ Vulnerabilities found in release branch ${context.ref}`,
+                body: `Found ${alerts.data.length} open vulnerabilities in the release branch.`,
+                labels: ['security', 'release-blocker']
+              });
+            }
+
+  create-release:
+    name: Create Internal Release
+    needs: [check-trigger, merge-fix-branches, verify-release-codeql]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.merge-fix-branches.outputs.release-branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Update package version
+        run: |
+          RELEASE_VERSION="${{ needs.merge-fix-branches.outputs.base-version }}-r${{ needs.merge-fix-branches.outputs.revision-number }}"
+          npm version "${RELEASE_VERSION}" --no-git-tag-version
+          
+          git config user.name "addventa-github-actions[bot]"
+          git config user.email "addventa-github-actions[bot]@addventa.com"
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to ${RELEASE_VERSION}"
+          git push
+
+      - name: Build release
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Create GitHub Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ needs.merge-fix-branches.outputs.base-version }}-r${{ needs.merge-fix-branches.outputs.revision-number }}';
+            const releaseBranch = '${{ needs.merge-fix-branches.outputs.release-branch }}';
+            
+            const releaseBody = [
+              `## Internal Release ${version}`,
+              '',
+              `This is an internal release with security fixes.`,
+              '',
+              `**Security Fixes:**`,
+              `- All known CodeQL vulnerabilities resolved or pending release`,
+              `- Branch: \`${releaseBranch}\``,
+              '',
+              `**Changes:**`,
+              `See merged fix branches for details.`,
+            ].join('\n');
+
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${version}`,
+              target_commitish: releaseBranch,
+              name: `Internal Release v${version}`,
+              body: releaseBody.join('\n')
+              draft: false,
+              prerelease: false
+            });
+
+            console.log(`Created release: ${release.data.html_url}`);
+
+      - name: Mark pending issues as resolved
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ needs.merge-fix-branches.outputs.base-version }}-r${{ needs.merge-fix-branches.outputs.revision-number }}';
+            const releaseBranch = '${{ needs.merge-fix-branches.outputs.release-branch }}';
+            
+            // Get all pending issues that were included in this release
+            const pendingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql,pending',
+              per_page: 100
+            });
+
+            for (const issue of pendingIssues.data) {
+              // Check if this issue's fix branch was merged into the release
+              const branchMatch = issue.body.match(/\*\*Fix Branch:\*\* `([^`]+)`/);
+              if (branchMatch) {
+                const fixBranch = branchMatch[1];
+                
+                // Add comment and update issue
+                const commentBody = [
+                  `✅ Fix included in release v${version}`,
+                  '',
+                  `Release branch: \`${releaseBranch}\``,
+                  `Release: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/releases/tag/v${version}`
+                ].join('\n');
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: commentBody
+                });
+
+                // Update issue: remove 'pending', add 'resolved', and close it
+                const currentLabels = issue.labels.map(l => l.name);
+                const updatedLabels = currentLabels
+                  .filter(l => l !== 'pending')
+                  .concat('resolved');
+
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  labels: updatedLabels
+                });
+
+                console.log(`Marked issue #${issue.number} as resolved and closed`);
+              }
+            }

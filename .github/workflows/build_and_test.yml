@@ -1,0 +1,48 @@
+name: Build and Test (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        required: false
+        type: string
+        default: '20'
+        description: 'Node.js version to use'
+      fetch-depth:
+        required: false
+        type: string
+        default: '0'
+        description: 'Git fetch depth for checkout'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Pre install - Install yarn and lerna globally
+        run: |
+          npm install yarn -g
+          npm install lerna -g
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build and test
+        run: |
+          lerna run build
+          lerna run test
+
