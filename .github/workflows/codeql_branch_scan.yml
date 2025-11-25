@@ -85,43 +85,7 @@ jobs:
         wait-for-processing: true
 
     - name: Log Found Alerts
-      id: log-found-alerts
-      if: 1
-      uses: actions/github-script@v7
+      uses: ./.github/actions/log_codeql_alerts
       with:
-        script: |
-          const branchRef = `refs/heads/${{ inputs.branch }}`;
-          
-          // First: Fetch ALL alerts (no severity filter) to see total count
-          console.log(`Fetching all alerts on branch ${{ inputs.branch }}...`);
-          const allAlertsResponse = await github.rest.codeScanning.listAlertsForRepo({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            state: 'open',
-            ref: branchRef,
-            per_page: 100
-          });
-          
-          const allAlerts = allAlertsResponse.data || [];
-          console.log(`Found ${allAlerts.length} total opened alerts on branch ${{ inputs.branch }}`);
-
-          // Second: Filter alerts by specific severity levels from the already-fetched alerts
-          const severityInput = '${{ inputs.severity }}';
-          const severityLevels = severityInput.split(',').map(s => s.trim().toLowerCase());
-          console.log(`Filtering for severities: ${severityLevels.join(', ')} on branch ${{ inputs.branch }}`);
-          
-          // Filter alerts by severity (check both rule.severity and rule.security_severity_level)
-          const filteredAlerts = allAlerts.filter(alert => {
-            const alertSeverity = (alert.rule?.security_severity_level || '').toLowerCase();
-            return severityLevels.includes(alertSeverity);
-          });
-
-          // Deduplicate alerts by alert number (shouldn't be necessary, but keeping for safety)
-          const uniqueAlerts = Array.from(
-            new Map(filteredAlerts.map(alert => [alert.number, alert])).values()
-          );
-
-          console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
-
-          // Store filtered alerts for subsequent steps
-          core.setOutput('alerts', JSON.stringify(uniqueAlerts));
+        branch: ${{ inputs.branch }}
+        severity: ${{ inputs.severity }}

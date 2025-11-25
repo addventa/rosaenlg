@@ -1,0 +1,50 @@
+
+name: "CodeQL Branch Scan (reusable)"
+
+on:
+  create:
+    branches:
+      - fix-codeql-alert-[0-9]+
+
+jobs:
+  setup:
+    name: Setup Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.config.outputs.branch }}
+      severity: ${{ steps.config.outputs.severity }}
+    steps:
+      - name: Set Configuration
+        id: config
+        run: |
+          # Change this line to set severity filter
+          SEVERITY="high,critical"
+          echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+          
+          # Get branch name from trigger
+          BRANCH="${{ github.ref_name }}"
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+  codeql-scan:
+    name: CodeQL Security Scan
+    needs: setup
+    uses: ./.github/workflows/codeql_branch_scan.yml
+    secrets: inherit
+    with:
+      branch: ${{ needs.setup.outputs.branch }}
+      severity: ${{ needs.setup.outputs.severity }}
+
+  log-alerts:
+    name: Log Found Alerts
+    needs: [setup, codeql-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: read
+      contents: read
+    
+    steps:
+      - name: Log Found Alerts
+        uses: ./.github/actions/log_codeql_alerts
+        with:
+          branch: ${{ needs.setup.outputs.branch }}
+          severity: ${{ needs.setup.outputs.severity }}

@@ -11,33 +11,27 @@ permissions:
   security-events: write
   issues: write
   pull-requests: write
+  actions: read
+  packages: read
 
 jobs:
+  codeql-scan:
+    name: CodeQL Security Scan
+    uses: ./.github/workflows/codeql_branch_scan.yml
+    secrets: inherit
+    with:
+      branch: ${{ github.ref_name }}
+      severity: 'high,critical'
+
   verify-fix:
     name: Verify Manual Fix
+    needs: codeql-scan
     runs-on: ubuntu-latest
     outputs:
       resolved: ${{ steps.check-resolved.outputs.resolved }}
       branch-name: ${{ steps.extract-alert.outputs.branch-name }}
     
     steps:
-      - name: Checkout branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript, typescript
-          queries: security-and-quality
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-
       - name: Extract alert ID from branch
         id: extract-alert
         run: |
@@ -82,7 +76,7 @@ jobs:
                   '⚠️ Changes pushed but vulnerability still present. Please review the fix.',
                   '',
                   `Commit: ${context.sha}`
-                ].join('\n');
+                ];
 
                 await github.rest.issues.createComment({
                   owner: context.repo.owner,

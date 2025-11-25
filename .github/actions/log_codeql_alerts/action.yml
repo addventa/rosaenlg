@@ -1,0 +1,81 @@
+name: 'Log CodeQL Alerts'
+description: 'Log and filter CodeQL alerts by severity'
+
+inputs:
+  branch:
+    description: 'Branch name to scan for alerts'
+    required: true
+  severity:
+    description: 'Severity filter (e.g., "high,critical")'
+    required: false
+    default: 'high,critical'
+
+outputs:
+  alerts:
+    description: 'JSON string of filtered alerts'
+  total-count:
+    description: 'Total count of open alerts'
+  filtered-count:
+    description: 'Count of filtered alerts'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Log Found Alerts
+      id: log-found-alerts
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const branchRef = `refs/heads/${{ inputs.branch }}`;
+          
+          // First: Fetch ALL alerts (no severity filter) to see total count
+          console.log(`Fetching all alerts on branch ${{ inputs.branch }}...`);
+          const allAlertsResponse = await github.rest.codeScanning.listAlertsForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            ref: branchRef,
+            per_page: 100
+          });
+          
+          const allAlerts = allAlertsResponse.data || [];
+          console.log(`Found ${allAlerts.length} total opened alerts on branch ${{ inputs.branch }}`);
+
+          // Second: Filter alerts by specific severity levels from the already-fetched alerts
+          const severityInput = '${{ inputs.severity }}';
+          const severityLevels = severityInput.split(',').map(s => s.trim().toLowerCase());
+          console.log(`Filtering for severities: ${severityLevels.join(', ')} on branch ${{ inputs.branch }}`);
+          
+          // Filter alerts by severity (check both rule.severity and rule.security_severity_level)
+          const filteredAlerts = allAlerts.filter(alert => {
+            const alertSeverity = (alert.rule?.security_severity_level || '').toLowerCase();
+            return severityLevels.includes(alertSeverity);
+          });
+
+          // Deduplicate alerts by alert number (shouldn't be necessary, but keeping for safety)
+          const uniqueAlerts = Array.from(
+            new Map(filteredAlerts.map(alert => [alert.number, alert])).values()
+          );
+
+          console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
+
+          // Store filtered alerts for subsequent steps
+          const alertsJson = JSON.stringify(uniqueAlerts);
+          core.setOutput('alerts', alertsJson);
+          core.setOutput('total-count', allAlerts.length.toString());
+          core.setOutput('filtered-count', uniqueAlerts.length.toString());
+          
+          // Also set as environment variable for composite action output
+          core.exportVariable('ALERTS_JSON', alertsJson);
+          core.exportVariable('TOTAL_COUNT', allAlerts.length.toString());
+          core.exportVariable('FILTERED_COUNT', uniqueAlerts.length.toString());
+
+    - name: Set Composite Action Outputs
+      id: set-outputs
+      run: |
+        # Read from environment variables set by the previous step
+        # and set them as composite action outputs
+        echo "alerts=${ALERTS_JSON}" >> $GITHUB_OUTPUT
+        echo "total-count=${TOTAL_COUNT}" >> $GITHUB_OUTPUT
+        echo "filtered-count=${FILTERED_COUNT}" >> $GITHUB_OUTPUT
+      shell: bash
