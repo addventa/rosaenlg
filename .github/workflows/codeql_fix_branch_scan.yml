@@ -10,9 +10,16 @@ jobs:
   setup:
     name: Setup Configuration
     runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      security-events: read
     outputs:
       branch: ${{ steps.config.outputs.branch }}
       severity: ${{ steps.config.outputs.severity }}
+      issue-number: ${{ steps.get-issue-info.outputs.issue-number }}
+      alert-id: ${{ steps.get-issue-info.outputs.alert-id }}
+      query-id: ${{ steps.get-issue-info.outputs.query-id }}
+      rule-id: ${{ steps.get-issue-info.outputs.rule-id }}
     steps:
       - name: Set Configuration
         id: config
@@ -24,6 +31,100 @@ jobs:
           # Get branch name from trigger
           BRANCH="${{ github.ref_name }}"
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          
+          # Extract alert ID from branch name (format: fix-codeql-alert-<number>)
+          ALERT_ID="${BRANCH#fix-codeql-alert-}"
+          echo "alert-id=${ALERT_ID}" >> $GITHUB_OUTPUT
+
+      - name: Get Issue Info with Security Events
+        id: get-issue-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branchName = '${{ github.ref_name }}';
+            const alertId = '${{ steps.config.outputs.alert-id }}';
+            
+            // Extract alert ID from branch name if not already set
+            const branchMatch = branchName.match(/^fix-codeql-alert-(\d+)$/);
+            const extractedAlertId = branchMatch ? parseInt(branchMatch[1]) : parseInt(alertId);
+            
+            console.log(`Looking for issue related to alert ID: ${extractedAlertId}`);
+            
+            // Find the issue that mentions this branch
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql'
+            });
+            
+            let issueNumber = null;
+            let relatedAlert = null;
+            
+            // Find issue that contains the branch name
+            for (const issue of issues.data) {
+              if (issue.body && issue.body.includes(`\`${branchName}\``)) {
+                issueNumber = issue.number;
+                console.log(`Found issue #${issueNumber} for branch ${branchName}`);
+                
+                // Get the CodeQL alert details
+                try {
+                  const alert = await github.rest.codeScanning.getAlert({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    alert_number: extractedAlertId
+                  });
+                  
+                  relatedAlert = alert.data;
+                  console.log(`Found CodeQL alert #${extractedAlertId}: ${relatedAlert.rule?.name || 'Unknown'}`);
+                  console.log(`Alert state: ${relatedAlert.state}`);
+                  console.log(`Alert severity: ${relatedAlert.rule?.security_severity_level || 'Unknown'}`);
+                } catch (error) {
+                  console.log(`Could not fetch alert #${extractedAlertId}: ${error.message}`);
+                }
+                
+                break;
+              }
+            }
+            
+            if (!issueNumber) {
+              console.log(`No issue found for branch ${branchName}`);
+            }
+            
+            // Extract rule/query ID from alert
+            let queryId = '';
+            let ruleId = '';
+            
+            if (relatedAlert && relatedAlert.rule) {
+              // Rule ID format: javascript/example/rule-name or similar
+              ruleId = relatedAlert.rule.id || '';
+              // Query ID might be in rule.tags or we can construct it from rule.id
+              // For CodeQL, the query is typically the rule ID
+              queryId = ruleId;
+              
+              console.log(`Extracted rule ID: ${ruleId}`);
+              console.log(`Using query ID: ${queryId}`);
+            }
+            
+            // Set outputs
+            core.setOutput('issue-number', issueNumber ? issueNumber.toString() : '');
+            core.setOutput('alert-id', extractedAlertId.toString());
+            core.setOutput('query-id', queryId);
+            core.setOutput('rule-id', ruleId);
+            
+            // Log security event info if available
+            if (relatedAlert) {
+              console.log('Security Event Info:');
+              console.log(`- Alert Number: ${relatedAlert.number}`);
+              console.log(`- Rule: ${relatedAlert.rule?.name || 'N/A'}`);
+              console.log(`- Rule ID: ${relatedAlert.rule?.id || 'N/A'}`);
+              console.log(`- Severity: ${relatedAlert.rule?.security_severity_level || 'N/A'}`);
+              console.log(`- State: ${relatedAlert.state || 'N/A'}`);
+              console.log(`- Created: ${relatedAlert.created_at || 'N/A'}`);
+              if (relatedAlert.most_recent_instance) {
+                console.log(`- Location: ${relatedAlert.most_recent_instance.location?.path || 'N/A'}`);
+              }
+            }
 
   codeql-scan:
     name: CodeQL Security Scan
@@ -33,6 +134,7 @@ jobs:
     with:
       branch: ${{ needs.setup.outputs.branch }}
       severity: ${{ needs.setup.outputs.severity }}
+      query-id: ${{ needs.setup.outputs.query-id }}
 
   log-alerts:
     name: Log Found Alerts

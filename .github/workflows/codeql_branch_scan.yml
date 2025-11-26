@@ -13,6 +13,11 @@ on:
         type: string
         description: 'Severity filter - affects which query packs are used (high/critical = security-extended, all = security-and-quality)'
         default: 'high,critical'
+      query-id:
+        required: false
+        type: string
+        description: 'Specific CodeQL query/rule ID to scan (e.g., javascript/example/rule-name). If provided, only this query will be run.'
+        default: ''
 
 jobs:
   analyze:

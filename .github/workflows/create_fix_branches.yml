@@ -24,24 +24,55 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+            
       - name: Log Found Alerts
-        id: log-found-alerts
         uses: ./.github/actions/log_codeql_alerts
         with:
           branch: ${{ inputs.branch }}
           severity: ${{ inputs.severity }}
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
-            
       - name: Check and Create Fix Branches
         uses: actions/github-script@v7
-        env:
-          ALERTS_DATA: ${{ steps.log-found-alerts.outputs.alerts }}
         with:
           script: |
-            const alertsData = process.env.ALERTS_DATA;
-            const alerts = JSON.parse(alertsData);
+            // Read alerts data from file programmatically
+            const fs = require('fs');
+            const path = require('path');
+            
+            const alertsFilePath = path.join(process.cwd(), 'alerts_data.json');
+            
+            let alertsData;
+            try {
+              alertsData = fs.readFileSync(alertsFilePath, 'utf8').trim();
+            } catch (error) {
+              console.error('Failed to read alerts data file:', error);
+              throw new Error(`Could not read alerts data file: ${error.message}`);
+            }
+
+
+            let alerts;
+            try {
+              alerts = JSON.parse(alertsData);
+            } catch (error) {
+              console.error('Failed to parse alerts data:', error);
+              console.error('Raw data preview:', alertsData.substring(0, 200));
+              throw new Error(`Invalid JSON in alerts data: ${error.message}`);
+            }
+            
+            // Ensure alerts is an array
+            if (!Array.isArray(alerts)) {
+              console.log('Alerts is not an array, converting...');
+              alerts = alerts ? [alerts] : [];
+            }
+            
+            if (alerts.length === 0) {
+              console.log('No alerts found. Skipping branch creation.');
+              return;
+            }
+            
+            console.log(`Processing ${alerts.length} alerts...`);
 
             for (const alert of alerts) {
               const branchName = `fix-codeql-alert-${alert.number}`;
@@ -82,12 +113,46 @@ jobs:
 
       - name: Create Fix Issues
         uses: actions/github-script@v7
-        env:
-          ALERTS_DATA: ${{ steps.log-found-alerts.outputs.alerts }}
         with:
           script: |
-            const alertsData = process.env.ALERTS_DATA;
-            const alerts = JSON.parse(alertsData);
+            // Read alerts data from file programmatically
+            const fs = require('fs');
+            const path = require('path');
+            
+            const alertsFilePath = path.join(process.cwd(), 'alerts_data.json');
+            
+            let alertsData;
+            try {
+              alertsData = fs.readFileSync(alertsFilePath, 'utf8').trim();
+            } catch (error) {
+              console.error('Failed to read alerts data file:', error);
+              throw new Error(`Could not read alerts data file: ${error.message}`);
+            }
+            
+            // Debug: log what we received
+            console.log('Raw alertsData length:', alertsData ? alertsData.length : 'null/undefined');
+            
+            let alerts;
+            try {
+              alerts = JSON.parse(alertsData);
+            } catch (error) {
+              console.error('Failed to parse alerts data:', error);
+              console.error('Raw data preview:', alertsData.substring(0, 200));
+              throw new Error(`Invalid JSON in alerts data: ${error.message}`);
+            }
+            
+            // Ensure alerts is an array
+            if (!Array.isArray(alerts)) {
+              console.log('Alerts is not an array, converting...');
+              alerts = alerts ? [alerts] : [];
+            }
+            
+            if (alerts.length === 0) {
+              console.log('No alerts found. Skipping issue creation.');
+              return;
+            }
+            
+            console.log(`Processing ${alerts.length} alerts...`);
 
             for (const alert of alerts) {
               const issueTitle = `[CodeQL] Fix vulnerability: ${alert.rule.description}`;

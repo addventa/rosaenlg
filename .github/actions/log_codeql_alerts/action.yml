@@ -60,22 +60,40 @@ runs:
           console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
 
           // Store filtered alerts for subsequent steps
-          const alertsJson = JSON.stringify(uniqueAlerts);
+          // Ensure we always have a valid JSON array, even if empty
+          const alertsJson = JSON.stringify(uniqueAlerts || []);
+          const totalCount = (allAlerts || []).length;
+          const filteredCount = (uniqueAlerts || []).length;
+          
+          console.log(`Setting outputs: alerts=${alertsJson.substring(0, 100)}..., total-count=${totalCount}, filtered-count=${filteredCount}`);
+          
           core.setOutput('alerts', alertsJson);
-          core.setOutput('total-count', allAlerts.length.toString());
-          core.setOutput('filtered-count', uniqueAlerts.length.toString());
+          core.setOutput('total-count', totalCount.toString());
+          core.setOutput('filtered-count', filteredCount.toString());
           
           // Also set as environment variable for composite action output
           core.exportVariable('ALERTS_JSON', alertsJson);
-          core.exportVariable('TOTAL_COUNT', allAlerts.length.toString());
-          core.exportVariable('FILTERED_COUNT', uniqueAlerts.length.toString());
+          core.exportVariable('TOTAL_COUNT', totalCount.toString());
+          core.exportVariable('FILTERED_COUNT', filteredCount.toString());
+          
+          // Write alerts data to file for programmatic access
+          const fs = require('fs');
+          fs.writeFileSync('alerts_data.json', alertsJson, 'utf8');
+          console.log('Wrote alerts data to alerts_data.json');
 
     - name: Set Composite Action Outputs
       id: set-outputs
       run: |
         # Read from environment variables set by the previous step
         # and set them as composite action outputs
-        echo "alerts=${ALERTS_JSON}" >> $GITHUB_OUTPUT
-        echo "total-count=${TOTAL_COUNT}" >> $GITHUB_OUTPUT
-        echo "filtered-count=${FILTERED_COUNT}" >> $GITHUB_OUTPUT
+        # Use fallback values if environment variables are not set
+        ALERTS_JSON_VALUE="${ALERTS_JSON:-[]}"
+        TOTAL_COUNT_VALUE="${TOTAL_COUNT:-0}"
+        FILTERED_COUNT_VALUE="${FILTERED_COUNT:-0}"
+        
+        echo "alerts=${ALERTS_JSON_VALUE}" >> $GITHUB_OUTPUT
+        echo "total-count=${TOTAL_COUNT_VALUE}" >> $GITHUB_OUTPUT
+        echo "filtered-count=${FILTERED_COUNT_VALUE}" >> $GITHUB_OUTPUT
+        
+        echo "Set outputs: alerts length=${#ALERTS_JSON_VALUE}, total-count=${TOTAL_COUNT_VALUE}, filtered-count=${FILTERED_COUNT_VALUE}"
       shell: bash

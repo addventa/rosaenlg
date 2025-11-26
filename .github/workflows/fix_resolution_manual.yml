@@ -17,7 +17,7 @@ permissions:
 jobs:
   codeql-scan:
     name: CodeQL Security Scan
-    uses: ./.github/workflows/codeql_branch_scan.yml
+    uses: ./.github/workflows/codeql_fix_branch_scan.yml
     secrets: inherit
     with:
       branch: ${{ github.ref_name }}
