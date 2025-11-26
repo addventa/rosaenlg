@@ -2,16 +2,9 @@
 name: Internal Release Production
 
 on:
-  workflow_dispatch:
-    inputs:
-      base_version:
-        description: 'Base version (X.Y.Z)'
-        required: true
-        type: string
-      revision_number:
-        description: 'Revision number (N)'
-        required: true
-        type: number
+  push:
+    branches:
+      - codeql-advanced-configuration-clean
 
 permissions:
   contents: write

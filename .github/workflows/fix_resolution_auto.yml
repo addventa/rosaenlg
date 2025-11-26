@@ -5,8 +5,6 @@ on:
   create:
     branches:
       - fix-codeql-alert-[0-9]+
-  issues:
-    types: [opened]
 
 permissions:
   contents: write
@@ -25,55 +23,112 @@ jobs:
       issue-number: ${{ steps.check.outputs.issue-number }}
     
     steps:
-      - name: Check issue labels or branch
-        id: check
+      - name: Extract and Validate Branch Name
+        id: extract-branch
         uses: actions/github-script@v7
         with:
           script: |
-            let issue_number = null;
-            let branch_name = null;
+            // Extract branch name from create event
+            const branch_name = context.payload.ref.replace('refs/heads/', '');
+            const branchMatch = branch_name.match(/^fix-codeql-alert-(\d+)$/);
             
-            // Handle different trigger types
-            if (context.eventName === 'issues') {
-              // Triggered by issue creation
-              issue_number = context.payload.issue.number;
-            } else if (context.eventName === 'create') {
-              // Triggered by branch creation - extract alert ID from branch name
-              branch_name = context.payload.ref.replace('refs/heads/', '');
-              const branchMatch = branch_name.match(/^fix-codeql-alert-(\d+)$/);
-              
-              if (!branchMatch) {
-                console.log(`Branch ${branch_name} does not match pattern fix-codeql-alert-*. Skipping.`);
-                core.setOutput('is-codeql', false);
-                return;
-              }
-              
-              // Find the issue by searching for issues with this branch name
-              const issues = await github.rest.issues.listForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                state: 'open',
-                labels: 'codeql'
-              });
-              
-              // Find issue that mentions this branch
-              const matchingIssue = issues.data.find(issue => 
-                issue.body && issue.body.includes(`\`${branch_name}\``)
-              );
-              
-              if (matchingIssue) {
-                issue_number = matchingIssue.number;
-              } else {
-                console.log(`No CodeQL issue found for branch ${branch_name}. Skipping.`);
-                core.setOutput('is-codeql', false);
-                return;
-              }
-            }
-            
-            if (!issue_number) {
-              core.setOutput('is-codeql', false);
+            if (!branchMatch) {
+              console.log(`Branch ${branch_name} does not match pattern fix-codeql-alert-*. Skipping.`);
+              const fs = require('fs');
+              fs.writeFileSync('branch_info.json', JSON.stringify({
+                isValid: false,
+                branchName: branch_name
+              }), 'utf8');
               return;
             }
+            
+            console.log(`Valid branch name: ${branch_name}`);
+            
+            // Write branch info to file
+            const fs = require('fs');
+            fs.writeFileSync('branch_info.json', JSON.stringify({
+              isValid: true,
+              branchName: branch_name,
+              alertId: branchMatch[1]
+            }), 'utf8');
+
+      - name: Find Related Issue
+        id: find-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read branch info
+            let branchInfo;
+            try {
+              branchInfo = JSON.parse(fs.readFileSync('branch_info.json', 'utf8'));
+            } catch (error) {
+              console.log('Could not read branch info:', error.message);
+              return;
+            }
+            
+            if (!branchInfo.isValid) {
+              console.log('Branch is not valid, skipping issue search');
+              return;
+            }
+            
+            const branch_name = branchInfo.branchName;
+            
+            console.log(`Searching for issue related to branch: ${branch_name}`);
+            
+            // Find the issue by searching for issues with this branch name
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql'
+            });
+            
+            // Find issue that mentions this branch
+            const matchingIssue = issues.data.find(issue => 
+              issue.body && issue.body.includes(`\`${branch_name}\``)
+            );
+            
+            let issue_number = null;
+            
+            if (matchingIssue) {
+              issue_number = matchingIssue.number;
+              console.log(`Found issue #${issue_number} for branch ${branch_name}`);
+            } else {
+              console.log(`No CodeQL issue found for branch ${branch_name}. Skipping.`);
+            }
+            
+            // Write issue info to file
+            fs.writeFileSync('issue_info.json', JSON.stringify({
+              issueNumber: issue_number,
+              branchName: branch_name
+            }), 'utf8');
+
+      - name: Get Issue Details and Check CodeQL Label
+        id: check-codeql
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read issue info
+            let issueInfo;
+            try {
+              issueInfo = JSON.parse(fs.readFileSync('issue_info.json', 'utf8'));
+            } catch (error) {
+              console.log('Could not read issue info:', error.message);
+              return;
+            }
+            
+            const issue_number = issueInfo.issueNumber;
+            
+            if (!issue_number) {
+              console.log('No issue number found, skipping');
+              return;
+            }
+            
+            console.log(`Fetching details for issue #${issue_number}...`);
             
             const issue = await github.rest.issues.get({
               owner: context.repo.owner,
@@ -82,32 +137,135 @@ jobs:
             });
 
             const isCodeQL = issue.data.labels.some(l => l.name === 'codeql');
-            core.setOutput('is-codeql', isCodeQL);
-            core.setOutput('issue-number', issue_number);
+            
+            console.log(`Issue #${issue_number} is CodeQL: ${isCodeQL}`);
+            
+            // Write issue details to file
+            fs.writeFileSync('issue_details.json', JSON.stringify({
+              issueNumber: issue_number,
+              isCodeQL: isCodeQL,
+              issueBody: issue.data.body,
+              labels: issue.data.labels.map(l => l.name)
+            }), 'utf8');
 
-            if (isCodeQL) {
-              // Extract alert ID from issue body
-              const alertMatch = issue.data.body.match(/\*\*Alert ID:\*\* (\d+)/);
-              
-              if (!alertMatch) {
-                core.setFailed(`Could not find Alert ID in issue #${issue_number} body. Expected format: **Alert ID:** <number>`);
-                return;
-              }
-              
-              core.setOutput('alert-id', alertMatch[1]);
-              
-              // Use branch name from create event if available, otherwise extract from issue body
-              if (branch_name) {
-                core.setOutput('branch-name', branch_name);
-              } else {
-                const branchMatch = issue.data.body.match(/\*\*Fix Branch:\*\* `([^`]+)`/);
-                if (!branchMatch) {
-                  core.setFailed(`Could not find Fix Branch in issue #${issue_number} body. Expected format: **Fix Branch:** \`<branch-name>\``);
-                  return;
-                }
-                core.setOutput('branch-name', branchMatch[1]);
-              }
+      - name: Extract Alert ID from Issue
+        id: extract-alert-id
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read issue details
+            let issueDetails;
+            try {
+              issueDetails = JSON.parse(fs.readFileSync('issue_details.json', 'utf8'));
+            } catch (error) {
+              console.log('Could not read issue details:', error.message);
+              return;
             }
+            
+            if (!issueDetails.isCodeQL) {
+              console.log('Issue is not a CodeQL issue, skipping alert ID extraction');
+              return;
+            }
+            
+            const issue_number = issueDetails.issueNumber;
+            const issue_body = issueDetails.issueBody || '';
+            
+            // Extract alert ID from issue body
+            const alertMatch = issue_body.match(/\*\*Alert ID:\*\* (\d+)/);
+            
+            if (!alertMatch) {
+              core.setFailed(`Could not find Alert ID in issue #${issue_number} body. Expected format: **Alert ID:** <number>`);
+              return;
+            }
+            
+            const alert_id = alertMatch[1];
+            console.log(`Extracted Alert ID: ${alert_id}`);
+            
+            // Write alert info to file
+            fs.writeFileSync('alert_info.json', JSON.stringify({
+              alertId: alert_id,
+              issueNumber: issue_number
+            }), 'utf8');
+
+      - name: Set Branch Name
+        id: set-branch-name
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read branch info
+            let branchInfo;
+            try {
+              branchInfo = JSON.parse(fs.readFileSync('branch_info.json', 'utf8'));
+            } catch (error) {
+              console.log('Could not read branch info:', error.message);
+              return;
+            }
+            
+            // Use branch name from create event (already available)
+            const branch_name = branchInfo.branchName;
+            
+            console.log(`Using branch name: ${branch_name}`);
+            
+            // Write final branch name to file
+            fs.writeFileSync('final_branch_info.json', JSON.stringify({
+              branchName: branch_name
+            }), 'utf8');
+
+      - name: Set Final Outputs
+        id: check
+        run: |
+          # Read all info files and set outputs
+          
+          # Check if branch is valid
+          if [ -f "branch_info.json" ]; then
+            IS_VALID=$(node -p "require('./branch_info.json').isValid || false")
+            if [ "$IS_VALID" != "true" ]; then
+              echo "is-codeql=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          else
+            echo "is-codeql=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Read issue details
+          if [ -f "issue_details.json" ]; then
+            IS_CODEQL=$(node -p "require('./issue_details.json').isCodeQL || false")
+            ISSUE_NUMBER=$(node -p "require('./issue_details.json').issueNumber || ''")
+            
+            echo "is-codeql=${IS_CODEQL}" >> $GITHUB_OUTPUT
+            echo "issue-number=${ISSUE_NUMBER}" >> $GITHUB_OUTPUT
+          else
+            echo "is-codeql=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Read alert ID
+          if [ -f "alert_info.json" ]; then
+            ALERT_ID=$(node -p "require('./alert_info.json').alertId || ''")
+            echo "alert-id=${ALERT_ID}" >> $GITHUB_OUTPUT
+          else
+            echo "alert-id=" >> $GITHUB_OUTPUT
+          fi
+          
+          # Read branch name
+          if [ -f "final_branch_info.json" ]; then
+            BRANCH_NAME=$(node -p "require('./final_branch_info.json').branchName || ''")
+            echo "branch-name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          else
+            # Fallback to branch_info.json
+            if [ -f "branch_info.json" ]; then
+              BRANCH_NAME=$(node -p "require('./branch_info.json').branchName || ''")
+              echo "branch-name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+            else
+              echo "branch-name=" >> $GITHUB_OUTPUT
+            fi
+          fi
+        shell: bash
 
   attempt-auto-fix:
     name: Attempt Automated Fix

@@ -58,6 +58,10 @@ runs:
           );
 
           console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
+          
+          // Log the numbers of all filtered alerts
+          const alertNumbers = uniqueAlerts.map(alert => alert.number).sort((a, b) => a - b);
+          console.log(`Filtered alert numbers: ${alertNumbers.join(', ')}`);
 
           // Store filtered alerts for subsequent steps
           // Ensure we always have a valid JSON array, even if empty

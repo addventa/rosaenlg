@@ -15,53 +15,132 @@ permissions:
   packages: read
 
 jobs:
-  codeql-scan:
-    name: CodeQL Security Scan
-    uses: ./.github/workflows/codeql_fix_branch_scan.yml
-    secrets: inherit
-    with:
-      branch: ${{ github.ref_name }}
-      severity: 'high,critical'
-
-  verify-fix:
-    name: Verify Manual Fix
-    needs: codeql-scan
+  get-query-info:
+    name: Get Query Info
     runs-on: ubuntu-latest
+    permissions:
+      security-events: read
     outputs:
-      resolved: ${{ steps.check-resolved.outputs.resolved }}
-      branch-name: ${{ steps.extract-alert.outputs.branch-name }}
-    
+      branch-name: ${{ steps.get-info.outputs.branch-name }}
+      query-id: ${{ steps.get-info.outputs.query-id }}
+      alert-id: ${{ steps.get-info.outputs.alert-id }}
     steps:
-      - name: Extract alert ID from branch
-        id: extract-alert
-        run: |
-          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
-          ALERT_ID="${BRANCH_NAME#fix-codeql-alert-}"
-          echo "alert-id=${ALERT_ID}" >> $GITHUB_OUTPUT
-          echo "branch-name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
-
-      - name: Check if vulnerability resolved
-        id: check-resolved
+      - name: Extract alert ID and get query ID
+        id: get-info
         uses: actions/github-script@v7
         with:
           script: |
-            const alertId = ${{ steps.extract-alert.outputs.alert-id }};
+            const branchName = context.ref.replace('refs/heads/', '');
+            const alertId = parseInt(branchName.replace('fix-codeql-alert-', ''));
             
+            // Get query ID from alert
             const alert = await github.rest.codeScanning.getAlert({
               owner: context.repo.owner,
               repo: context.repo.repo,
               alert_number: alertId
             });
             
-            const resolved = alert.data.state === 'fixed' || alert.data.state === 'dismissed';
+            const queryId = alert.data.rule?.id || '';
+            console.log(`Found query ID: ${queryId}`);
+            console.log(`Found alert ID: ${alertId}`);
+            
+            core.setOutput('branch-name', branchName);
+            core.setOutput('query-id', queryId);
+            core.setOutput('alert-id', alertId.toString());
+
+  codeql-analysis:
+    name: Run CodeQL Analysis
+    needs: get-query-info
+    uses: ./.github/workflows/codeql_branch_analysis.yml
+    with:
+      branch: ${{ needs.get-query-info.outputs.branch-name }}
+      severity: 'high,critical'
+      query-id: ${{ needs.get-query-info.outputs.query-id }}
+
+  verify-fix:
+    name: Verify Manual Fix
+    needs: [ codeql-analysis, get-query-info]
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: read
+    outputs:
+      resolved: ${{ steps.check-resolved.outputs.resolved }}
+      branch-name: ${{ needs.get-query-info.outputs.branch-name }}
+    
+    steps:
+
+      - name: Download CodeQL Analysis Results
+        uses: actions/download-artifact@v4
+        with:
+          name: codeql-analysis-results
+          path: codeql-results
+
+      - name: Check if vulnerability resolved
+        id: check-resolved
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            const alertId = ${{ needs.get-query-info.outputs.alert-id }};
+            const queryId = '${{ needs.get-query-info.outputs.query-id }}';
+            let resolved = false;
+            
+            // Read CodeQL analysis results from downloaded artifacts
+            const resultsPath = path.join(process.cwd(), 'codeql-results', 'codeql-results.json');
+            
+            try {
+              const analysisResults = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+              const totalResults = analysisResults.summary?.totalResults || 0;
+              
+              console.log(`CodeQL analysis found ${totalResults} results`);
+              
+              // If no results found, vulnerability is resolved
+              if (totalResults === 0) {
+                resolved = true;
+                console.log('No vulnerabilities found in analysis - vulnerability is resolved');
+              } else if (queryId && analysisResults.results) {
+                // Check if the specific query/rule is still present
+                const matchingResults = analysisResults.results.filter(r => 
+                  r.ruleId === queryId || r.ruleId.includes(queryId)
+                );
+                
+                console.log(`Found ${matchingResults.length} results matching query ${queryId}`);
+                resolved = matchingResults.length === 0;
+                
+                if (resolved) {
+                  console.log('No matching results found - vulnerability is resolved');
+                } else {
+                  console.log('Matching results found - vulnerability still present');
+                }
+              } else {
+                // If we can't match by query ID, check if any results exist
+                resolved = totalResults === 0;
+              }
+            } catch (error) {
+              console.log('Could not read analysis results, falling back to API check:', error.message);
+              
+              // Fallback to API check
+              const alert = await github.rest.codeScanning.getAlert({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                alert_number: alertId
+              });
+              
+              resolved = alert.data.state === 'fixed' || alert.data.state === 'dismissed';
+              console.log(`API check: vulnerability resolved = ${resolved}`);
+            }
+            
             core.setOutput('resolved', resolved);
+            console.log(`Final result: vulnerability resolved = ${resolved}`);
             
       - name: Alert if still vulnerable
         if: steps.check-resolved.outputs.resolved != 'true'
         uses: actions/github-script@v7
         with:
           script: |
-            const branchName = '${{ steps.extract-alert.outputs.branch-name }}';
+            const branchName = '${{ needs.get-query-info.outputs.branch-name }}';
             
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,

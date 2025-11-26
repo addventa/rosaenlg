@@ -1,0 +1,174 @@
+
+name: "CodeQL Branch Analysis (reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        description: 'Branch name to scan'
+      severity:
+        required: false
+        type: string
+        description: 'Severity filter - affects which query packs are used (high/critical = security-extended, all = security-and-quality)'
+        default: 'high,critical'
+      query-id:
+        required: false
+        type: string
+        description: 'Specific CodeQL query/rule ID to scan (e.g., javascript/example/rule-name). If provided, only this query will be run.'
+        default: ''
+    outputs:
+      results-file:
+        description: 'Path to the SARIF results file'
+        value: ${{ jobs.analyze.outputs.results-file }}
+      results-json:
+        description: 'Path to the JSON results file'
+        value: ${{ jobs.analyze.outputs.results-json }}
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      results-file: ${{ steps.set-outputs.outputs.results-file }}
+      results-json: ${{ steps.set-outputs.outputs.results-json }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.branch }}
+
+    - name: Install CodeQL CLI
+      uses: github/codeql-action/setup-codeql@v3
+      with:
+        version: latest
+
+    - name: Determine Query Configuration
+      id: query-config
+      run: |
+        SEVERITY="${{ inputs.severity }}"
+        QUERY_ID="${{ inputs.query-id }}"
+        
+        if [ -n "$QUERY_ID" ]; then
+          # If a specific query ID is provided, use it with the appropriate query pack
+          if [[ "$SEVERITY" == "high,critical" ]] || [[ "$SEVERITY" == "critical" ]] || [[ "$SEVERITY" == "high" ]]; then
+            BASE_PACK="security-extended"
+          else
+            BASE_PACK="security-and-quality"
+          fi
+          # Format: query-pack+query-id to add specific query to the pack
+          QUERY_SPEC="${BASE_PACK}+${QUERY_ID}"
+          echo "query-spec=$QUERY_SPEC" >> $GITHUB_OUTPUT
+          echo "Using specific query: $QUERY_SPEC"
+        elif [[ "$SEVERITY" == "high,critical" ]] || [[ "$SEVERITY" == "critical" ]] || [[ "$SEVERITY" == "high" ]]; then
+          # Use security-extended for high/critical - faster, focuses on security issues
+          QUERY_PACK="security-extended"
+          echo "query-spec=$QUERY_PACK" >> $GITHUB_OUTPUT
+          echo "Using security-extended query pack (faster, security-focused)"
+        else
+          # Use security-and-quality for all severities - more comprehensive
+          QUERY_PACK="security-and-quality"
+          echo "query-spec=$QUERY_PACK" >> $GITHUB_OUTPUT
+          echo "Using security-and-quality query pack (comprehensive)"
+        fi
+
+    - name: Create CodeQL Database
+      run: |
+        codeql database create codeql-database \
+          --language=javascript \
+          --source-root=. \
+          --threads=0
+
+    - name: Run CodeQL Analysis
+      run: |
+        # Run analysis and output to SARIF format
+        codeql database analyze codeql-database \
+          --format=sarif-latest \
+          --output=codeql-results.sarif \
+          --threads=0 \
+          -- ${{ steps.query-config.outputs.query-spec }}
+        
+        echo "CodeQL analysis completed. Results saved to codeql-results.sarif"
+
+    - name: Convert SARIF to JSON
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Read SARIF file
+          const sarifPath = path.join(process.cwd(), 'codeql-results.sarif');
+          let sarifData;
+          
+          try {
+            sarifData = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
+          } catch (error) {
+            console.error('Failed to read SARIF file:', error);
+            throw new Error(`Could not read SARIF file: ${error.message}`);
+          }
+          
+          // Extract results in a more usable format
+          const results = [];
+          
+          if (sarifData.runs && sarifData.runs.length > 0) {
+            for (const run of sarifData.runs) {
+              if (run.results && run.results.length > 0) {
+                for (const result of run.results) {
+                  const rule = run.tool?.driver?.rules?.find(r => r.id === result.ruleId);
+                  
+                  results.push({
+                    ruleId: result.ruleId,
+                    ruleName: rule?.name || result.ruleId,
+                    severity: result.level || rule?.defaultConfiguration?.level || 'warning',
+                    message: result.message?.text || result.message?.markdown || '',
+                    locations: result.locations?.map(loc => ({
+                      file: loc.physicalLocation?.artifactLocation?.uri || '',
+                      line: loc.physicalLocation?.region?.startLine || 0,
+                      column: loc.physicalLocation?.region?.startColumn || 0
+                    })) || []
+                  });
+                }
+              }
+            }
+          }
+          
+          // Write JSON results
+          const jsonPath = path.join(process.cwd(), 'codeql-results.json');
+          fs.writeFileSync(jsonPath, JSON.stringify({
+            summary: {
+              totalResults: results.length,
+              timestamp: new Date().toISOString(),
+              branch: '${{ inputs.branch }}',
+              severity: '${{ inputs.severity }}',
+              queryId: '${{ inputs.query-id }}'
+            },
+            results: results
+          }, null, 2), 'utf8');
+          
+          console.log(`Converted ${results.length} results to JSON format`);
+          console.log(`Results saved to: ${jsonPath}`);
+
+    - name: Upload Results as Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-analysis-results
+        path: |
+          codeql-results.sarif
+          codeql-results.json
+        retention-days: 7
+
+    - name: Set Outputs
+      id: set-outputs
+      run: |
+        echo "results-file=codeql-results.sarif" >> $GITHUB_OUTPUT
+        echo "results-json=codeql-results.json" >> $GITHUB_OUTPUT
+        echo "Results files uploaded as artifacts:"
+        echo "  SARIF: codeql-results.sarif"
+        echo "  JSON: codeql-results.json"
+        echo "Download using: actions/download-artifact@v4 with name: codeql-analysis-results"
