@@ -14,7 +14,7 @@ on:
 
 permissions:
   contents: write  # Required to create branches
-  security-events: read
+  security-events: write  # Required to update alerts (assign branches)
   issues: write
   pull-requests: write
 
@@ -32,6 +32,7 @@ jobs:
         with:
           branch: ${{ inputs.branch }}
           severity: ${{ inputs.severity }}
+          upload: true
 
       - name: Check and Create Fix Branches
         uses: actions/github-script@v7
@@ -50,7 +51,6 @@ jobs:
               console.error('Failed to read alerts data file:', error);
               throw new Error(`Could not read alerts data file: ${error.message}`);
             }
-
 
             let alerts;
             try {
@@ -78,7 +78,6 @@ jobs:
               const branchName = `fix-codeql-alert-${alert.number}`;
               let branchExists = false;
 
-              // Check if branch exists
               try {
                 await github.rest.repos.getBranch({
                   owner: context.repo.owner,
@@ -90,7 +89,7 @@ jobs:
               } catch (err) {
                 if (err.status !== 404) throw err;
               }
-
+              
               if (!branchExists) {
                 // Create branch from specified branch
                 console.log(`Creating branch ${branchName}...`);
@@ -207,8 +206,58 @@ jobs:
                 const pathParts = locationPath.split('/');
                 if (pathParts.length >= 2 && pathParts[0] === 'packages') {
                   labels.push(`pkg:${pathParts[1]}`);
-                }
               }
+
+              // Check if a branch is already assigned/attached to this alert, and assign/attach this branch otherwise
+              try {
+                // Get the alert details to check which ref it exists on
+                const alertDetails = await github.rest.codeScanning.getAlert({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  alert_number: alert.number
+                });
+
+                const alertRef = alertDetails.data.ref;
+                const alertRefName = alertRef ? alertRef.replace('refs/heads/', '') : null;
+                
+                // Check if the alert is already on our fix branch
+                if (alertRefName === branchName) {
+                  console.log(`Alert #${alert.number} is already associated with branch ${branchName}`);
+                } else {
+                  // Check if there's another fix branch for this alert
+                  let branchAlreadyAssigned = false;
+                  
+                  if (alertRefName && alertRefName.startsWith('fix-codeql-alert-')) {
+                    // Extract alert number from branch name
+                    const match = alertRefName.match(/^fix-codeql-alert-(\d+)$/);
+                    if (match && match[1] === alert.number.toString()) {
+                      branchAlreadyAssigned = true;
+                      console.log(`Alert #${alert.number} is already associated with branch ${alertRefName}, skipping assignment of ${branchName}`);
+                    }
+                  }
+
+                  if (!branchAlreadyAssigned) {
+                    // Update the alert to assign/attach the fix branch to it by setting its ref
+                    try {
+                      await github.rest.codeScanning.updateAlert({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        alert_number: alert.number,
+                        ref: `refs/heads/${branchName}`
+                      });
+                      console.log(`Successfully assigned branch ${branchName} to alert #${alert.number}`);
+                    } catch (error) {
+                      // If updating ref is not supported by the API, log the error but continue
+                      console.error(`Failed to assign branch ${branchName} to alert #${alert.number}:`, error.message);
+                      console.log(`Note: Alert #${alert.number} is tracked for fix branch ${branchName}, but ref update may not be supported by the API`);
+                    }
+                  }
+                }
+              } catch (error) {
+                console.error(`Error checking branch assignment for alert #${alert.number}:`, error.message);
+                // Continue processing other alerts even if one fails
+              }
+            }
 
               const issue = await github.rest.issues.create({
                 owner: context.repo.owner,

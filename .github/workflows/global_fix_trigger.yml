@@ -55,6 +55,7 @@ jobs:
     with:
       branch: ${{ needs.setup.outputs.target-branch }}
       severity: ${{ needs.setup.outputs.severity }}
+      upload: true
 
   create-fix-branches:
     name: Create Fix Branches and Issues

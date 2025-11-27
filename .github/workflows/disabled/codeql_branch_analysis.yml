@@ -17,7 +17,6 @@ on:
         required: false
         type: string
         description: 'Specific CodeQL query/rule ID to scan (e.g., javascript/example/rule-name). If provided, only this query will be run.'
-        default: ''
     outputs:
       results-file:
         description: 'Path to the SARIF results file'
@@ -33,6 +32,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+      security-events: read
     outputs:
       results-file: ${{ steps.set-outputs.outputs.results-file }}
       results-json: ${{ steps.set-outputs.outputs.results-json }}
@@ -44,56 +44,49 @@ jobs:
         ref: ${{ inputs.branch }}
 
     - name: Install CodeQL CLI
-      uses: github/codeql-action/setup-codeql@v3
-      with:
-        version: latest
+      uses: github/codeql-action/setup-codeql@v4
 
-    - name: Determine Query Configuration
-      id: query-config
+    - name: Add CodeQL to PATH
       run: |
-        SEVERITY="${{ inputs.severity }}"
-        QUERY_ID="${{ inputs.query-id }}"
-        
-        if [ -n "$QUERY_ID" ]; then
-          # If a specific query ID is provided, use it with the appropriate query pack
-          if [[ "$SEVERITY" == "high,critical" ]] || [[ "$SEVERITY" == "critical" ]] || [[ "$SEVERITY" == "high" ]]; then
-            BASE_PACK="security-extended"
-          else
-            BASE_PACK="security-and-quality"
-          fi
-          # Format: query-pack+query-id to add specific query to the pack
-          QUERY_SPEC="${BASE_PACK}+${QUERY_ID}"
-          echo "query-spec=$QUERY_SPEC" >> $GITHUB_OUTPUT
-          echo "Using specific query: $QUERY_SPEC"
-        elif [[ "$SEVERITY" == "high,critical" ]] || [[ "$SEVERITY" == "critical" ]] || [[ "$SEVERITY" == "high" ]]; then
-          # Use security-extended for high/critical - faster, focuses on security issues
-          QUERY_PACK="security-extended"
-          echo "query-spec=$QUERY_PACK" >> $GITHUB_OUTPUT
-          echo "Using security-extended query pack (faster, security-focused)"
+        # Find CodeQL installation directory and add to PATH
+        CODEQL_DIR=$(find "$RUNNER_TOOL_CACHE" -type d -name "codeql" -path "*/CodeQL/*" 2>/dev/null | head -1)
+        if [ -z "$CODEQL_DIR" ]; then
+          CODEQL_DIR=$(find /opt/hostedtoolcache -type d -name "codeql" -path "*/CodeQL/*" 2>/dev/null | head -1)
+        fi
+        if [ -n "$CODEQL_DIR" ] && [ -d "$CODEQL_DIR" ]; then
+          echo "$CODEQL_DIR" >> $GITHUB_PATH
+          echo "Added CodeQL to PATH: $CODEQL_DIR"
+          echo "CODEQL_DIR=$CODEQL_DIR" >> $GITHUB_ENV
         else
-          # Use security-and-quality for all severities - more comprehensive
-          QUERY_PACK="security-and-quality"
-          echo "query-spec=$QUERY_PACK" >> $GITHUB_OUTPUT
-          echo "Using security-and-quality query pack (comprehensive)"
+          echo "Warning: Could not find CodeQL directory, will try to find binary directly"
+        fi
+        
+        echo "Query ID input value: '${{ inputs.query-id }}'"
+        if [ -z "${{ inputs.query-id }}" ]; then
+          echo "Query ID is empty or not set"
+        else
+          echo "Query ID is set: ${{ inputs.query-id }}"
         fi
 
     - name: Create CodeQL Database
       run: |
+        QUERY_ID="${{ inputs.query-id }}"
+
         codeql database create codeql-database \
           --language=javascript \
           --source-root=. \
+          ${QUERY_ID:+--query-filter="id:$QUERY_ID"} \
           --threads=0
 
     - name: Run CodeQL Analysis
       run: |
-        # Run analysis and output to SARIF format
+        QUERY_ID="${{ inputs.query-id }}" 
+
         codeql database analyze codeql-database \
-          --format=sarif-latest \
-          --output=codeql-results.sarif \
+          ${QUERY_ID:+--query-filter="id:$QUERY_ID"} \
           --threads=0 \
-          -- ${{ steps.query-config.outputs.query-spec }}
-        
-        echo "CodeQL analysis completed. Results saved to codeql-results.sarif"
+          --format=sarif-latest \
+          --output=codeql-results.sarif
 
     - name: Convert SARIF to JSON
       uses: actions/github-script@v7
@@ -113,6 +106,22 @@ jobs:
             throw new Error(`Could not read SARIF file: ${error.message}`);
           }
           
+          // Count total alerts in SARIF
+          let totalAlerts = 0;
+          if (sarifData.runs && sarifData.runs.length > 0) {
+            for (const run of sarifData.runs) {
+              if (run.results && run.results.length > 0) {
+                totalAlerts += run.results.length;
+              }
+            }
+          }
+          console.log(`Found ${totalAlerts} total alerts in CodeQL analysis results`);
+          
+          // Parse severity filter
+          const severityInput = '${{ inputs.severity }}';
+          const severityLevels = severityInput.split(',').map(s => s.trim().toLowerCase());
+          console.log(`Filtering results by severity: ${severityLevels.join(', ')}`);
+          
           // Extract results in a more usable format
           const results = [];
           
@@ -122,10 +131,24 @@ jobs:
                 for (const result of run.results) {
                   const rule = run.tool?.driver?.rules?.find(r => r.id === result.ruleId);
                   
+                  // Get security severity from rule properties
+                  const securitySeverity = (
+                    rule?.properties?.['security-severity'] ||
+                    rule?.properties?.securitySeverity ||
+                    rule?.properties?.['security_severity'] ||
+                    ''
+                  ).toLowerCase();
+                  
+                  // Filter by severity if severity filter is provided
+                  if (severityLevels.length > 0 && severityLevels[0] !== '' && !severityLevels.includes(securitySeverity)) {
+                    continue; // Skip this result if it doesn't match the severity filter
+                  }
+                  
                   results.push({
                     ruleId: result.ruleId,
                     ruleName: rule?.name || result.ruleId,
                     severity: result.level || rule?.defaultConfiguration?.level || 'warning',
+                    securitySeverity: securitySeverity || 'unknown',
                     message: result.message?.text || result.message?.markdown || '',
                     locations: result.locations?.map(loc => ({
                       file: loc.physicalLocation?.artifactLocation?.uri || '',
@@ -137,6 +160,8 @@ jobs:
               }
             }
           }
+          
+          console.log(`After severity filtering: ${results.length} alerts match the severity criteria`);
           
           // Write JSON results
           const jsonPath = path.join(process.cwd(), 'codeql-results.json');

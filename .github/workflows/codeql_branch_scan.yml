@@ -18,6 +18,11 @@ on:
         type: string
         description: 'Specific CodeQL query/rule ID to scan (e.g., javascript/example/rule-name). If provided, only this query will be run.'
         default: ''
+      upload:
+        required: false
+        type: boolean
+        description: 'Whether to upload results to GitHub Security'
+        default: false
 
 jobs:
   analyze:
@@ -52,23 +57,6 @@ jobs:
       with:
         ref: ${{ inputs.branch }}
 
-    # Determine which query pack to use based on severity filter
-    # This speeds up analysis by running fewer queries for high/critical severity scans
-    - name: Determine Query Pack
-      id: query-pack
-      run: |
-        SEVERITY="${{ inputs.severity }}"
-        if [[ "$SEVERITY" == "high,critical" ]] || [[ "$SEVERITY" == "critical" ]] || [[ "$SEVERITY" == "high" ]]; then
-          # Use security-extended for high/critical - faster, focuses on security issues
-          QUERY_PACK="security-extended"
-          echo "Using security-extended query pack (faster, security-focused)"
-        else
-          # Use security-and-quality for all severities - more comprehensive
-          QUERY_PACK="security-and-quality"
-          echo "Using security-and-quality query pack (comprehensive)"
-        fi
-        echo "query-pack=$QUERY_PACK" >> $GITHUB_OUTPUT
-
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v4
@@ -76,6 +64,10 @@ jobs:
         languages: javascript-typescript
         build-mode: none
         config-file: ./.github/codeql/codeql-config.yml
+        config: |
+          ${{ inputs.query-id && format('query-filters:
+            - include:
+                id: {0}', inputs.query-id) || '' }}
 
     # If the analyze step fails for one of the languages you are analyzing with
     # "We were unable to automatically build your code", modify the matrix above
@@ -86,11 +78,23 @@ jobs:
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
       with:
+        upload: ${{ inputs.upload }}
         category: "/language:javascript-typescript"
         wait-for-processing: true
+        output: ./codeql-results/
 
     - name: Log Found Alerts
       uses: ./.github/actions/log_codeql_alerts
       with:
         branch: ${{ inputs.branch }}
         severity: ${{ inputs.severity }}
+        upload: ${{ inputs.upload }}
+        
+    - name: Upload Results as Artifacts
+      if: ${{ !inputs.upload }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-analysis-results
+        path: ./codeql-results/
+        retention-days: 1
+

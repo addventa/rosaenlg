@@ -9,6 +9,11 @@ inputs:
     description: 'Severity filter (e.g., "high,critical")'
     required: false
     default: 'high,critical'
+  upload:
+    required: false
+    type: boolean
+    description: 'Whether to upload results to GitHub Security'
+    default: false
 
 outputs:
   alerts:
@@ -26,48 +31,236 @@ runs:
       uses: actions/github-script@v7
       with:
         script: |
-          const branchRef = `refs/heads/${{ inputs.branch }}`;
+          const upload = ${{ inputs.upload }};
+          const fs = require('fs');
+          const path = require('path');
           
-          // First: Fetch ALL alerts (no severity filter) to see total count
-          console.log(`Fetching all alerts on branch ${{ inputs.branch }}...`);
-          const allAlertsResponse = await github.rest.codeScanning.listAlertsForRepo({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            state: 'open',
-            ref: branchRef,
-            per_page: 100
-          });
-          
-          const allAlerts = allAlertsResponse.data || [];
-          console.log(`Found ${allAlerts.length} total opened alerts on branch ${{ inputs.branch }}`);
-
-          // Second: Filter alerts by specific severity levels from the already-fetched alerts
+          // Parse severity filter
           const severityInput = '${{ inputs.severity }}';
           const severityLevels = severityInput.split(',').map(s => s.trim().toLowerCase());
-          console.log(`Filtering for severities: ${severityLevels.join(', ')} on branch ${{ inputs.branch }}`);
           
-          // Filter alerts by severity (check both rule.severity and rule.security_severity_level)
-          const filteredAlerts = allAlerts.filter(alert => {
-            const alertSeverity = (alert.rule?.security_severity_level || '').toLowerCase();
-            return severityLevels.includes(alertSeverity);
-          });
-
-          // Deduplicate alerts by alert number (shouldn't be necessary, but keeping for safety)
-          const uniqueAlerts = Array.from(
-            new Map(filteredAlerts.map(alert => [alert.number, alert])).values()
-          );
-
-          console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
+          let alertsJson, totalCount, filteredCount;
           
-          // Log the numbers of all filtered alerts
-          const alertNumbers = uniqueAlerts.map(alert => alert.number).sort((a, b) => a - b);
-          console.log(`Filtered alert numbers: ${alertNumbers.join(', ')}`);
+          if (upload) {
+            // Use API-based approach when upload is true
+            const branchRef = `refs/heads/${{ inputs.branch }}`;
+            
+            // First: Fetch ALL alerts (no severity filter) to see total count
+            console.log(`Fetching all alerts on branch ${{ inputs.branch }}...`);
+            const allAlertsResponse = await github.rest.codeScanning.listAlertsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              ref: branchRef,
+              per_page: 100
+            });
+            
+            const allAlerts = allAlertsResponse.data || [];
+            console.log(`Found ${allAlerts.length} total opened alerts on branch ${{ inputs.branch }}`);
+            console.log(`Filtering for severities: ${severityLevels.join(', ')} on branch ${{ inputs.branch }}`);
+            
+            // Filter alerts by severity (check both rule.severity and rule.security_severity_level)
+            const filteredAlerts = allAlerts.filter(alert => {
+              const alertSeverity = (alert.rule?.security_severity_level || '').toLowerCase();
+              return severityLevels.includes(alertSeverity);
+            });
 
-          // Store filtered alerts for subsequent steps
-          // Ensure we always have a valid JSON array, even if empty
-          const alertsJson = JSON.stringify(uniqueAlerts || []);
-          const totalCount = (allAlerts || []).length;
-          const filteredCount = (uniqueAlerts || []).length;
+            // Deduplicate alerts by alert number (shouldn't be necessary, but keeping for safety)
+            const uniqueAlerts = Array.from(
+              new Map(filteredAlerts.map(alert => [alert.number, alert])).values()
+            );
+
+            console.log(`Found ${uniqueAlerts.length} opened ${severityInput} alerts on branch ${{ inputs.branch }}`);
+            
+            // Log the numbers of all filtered alerts
+            const alertNumbers = uniqueAlerts.map(alert => alert.number).sort((a, b) => a - b);
+            console.log(`Filtered alert numbers: ${alertNumbers.join(', ')}`);
+
+            // Store filtered alerts for subsequent steps
+            // Ensure we always have a valid JSON array, even if empty
+            alertsJson = JSON.stringify(uniqueAlerts || []);
+            totalCount = (allAlerts || []).length;
+            filteredCount = (uniqueAlerts || []).length;
+            
+          } else {
+            // Use SARIF file-based approach when upload is false
+            console.log(`Filtering for severities: ${severityLevels.join(', ')}`);
+            
+            // Find all SARIF files - check multiple possible locations
+            let sarifFiles = [];
+            
+            // Function to recursively find SARIF files
+            const findSarifFiles = (dir) => {
+              if (!fs.existsSync(dir)) {
+                return;
+              }
+              
+              try {
+                const stats = fs.statSync(dir);
+                if (!stats.isDirectory()) {
+                  // If it's a file and ends with .sarif, add it
+                  if (dir.endsWith('.sarif')) {
+                    sarifFiles.push(dir);
+                  }
+                  return;
+                }
+                
+                const files = fs.readdirSync(dir);
+                for (const file of files) {
+                  const fullPath = path.join(dir, file);
+                  try {
+                    const fileStats = fs.statSync(fullPath);
+                    if (fileStats.isDirectory()) {
+                      // Recursively search subdirectories
+                      findSarifFiles(fullPath);
+                    } else if (fileStats.isFile() && file.endsWith('.sarif')) {
+                      sarifFiles.push(fullPath);
+                    }
+                  } catch (error) {
+                    console.log(`Error checking ${fullPath}:`, error.message);
+                  }
+                }
+              } catch (error) {
+                console.log(`Error reading directory ${dir}:`, error.message);
+              }
+            };
+            
+            // Check common locations
+            findSarifFiles('./codeql-results');
+            findSarifFiles('./');
+            
+            // Also check specific expected paths
+            const specificPaths = [
+              './codeql-results.sarif',
+              './codeql-results/codeql-results.sarif',
+              './codeql-results/javascript-typescript.sarif'
+            ];
+            
+            for (const specificPath of specificPaths) {
+              if (fs.existsSync(specificPath)) {
+                try {
+                  const stats = fs.statSync(specificPath);
+                  if (stats.isFile() && !sarifFiles.includes(specificPath)) {
+                    sarifFiles.push(specificPath);
+                  }
+                } catch (error) {
+                  console.log(`Error checking ${specificPath}:`, error.message);
+                }
+              }
+            }
+            
+            // Remove duplicates
+            sarifFiles = [...new Set(sarifFiles)];
+            
+            console.log(`Found ${sarifFiles.length} SARIF file(s): ${sarifFiles.join(', ')}`);
+            
+            if (sarifFiles.length === 0) {
+              throw new Error('No SARIF files found in ./codeql-results/ or current directory. CodeQL scan results are required.');
+            } else {
+              let totalIssues = 0;
+              let filteredIssues = 0;
+              const allResults = [];
+              const filteredResults = [];
+              const stepSummaryPath = process.env.GITHUB_STEP_SUMMARY;
+              let stepSummaryContent = '';
+              
+              // Process each SARIF file
+              for (const sarifFile of sarifFiles) {
+                console.log(`Processing ${sarifFile}...`);
+                
+                try {
+                  // Check if it's actually a file before reading
+                  const stats = fs.statSync(sarifFile);
+                  if (!stats.isFile()) {
+                    console.log(`Skipping ${sarifFile} - not a file (is directory: ${stats.isDirectory()})`);
+                    continue;
+                  }
+                  
+                  const sarifData = JSON.parse(fs.readFileSync(sarifFile, 'utf8'));
+                  const fileName = path.basename(sarifFile);
+                  
+                  if (!sarifData.runs || sarifData.runs.length === 0) {
+                    console.log(`No runs found in ${fileName}`);
+                    continue;
+                  }
+                  
+                  const run = sarifData.runs[0];
+                  const results = run.results || [];
+                  const rules = run.tool?.driver?.rules || [];
+                  
+                  totalIssues += results.length;
+                  
+                  // Filter results by severity
+                  const fileFilteredResults = [];
+                  for (const result of results) {
+                  console.log(rules);
+                    const rule = rules.find(r => r.id === result.ruleId);
+
+                    console.log(rule);
+
+                    // Get security severity from rule properties
+                    const securitySeverity = (
+                      rule?.properties?.['security-severity'] ||
+                      rule?.properties?.securitySeverity ||
+                      rule?.properties?.['security_severity'] ||
+                      ''
+                    ).toLowerCase();
+                    
+                    // Include result if severity matches or if no severity filter
+                    if (severityLevels.length === 0 || severityLevels[0] === '' || severityLevels.includes(securitySeverity)) {
+                      fileFilteredResults.push({
+                        ruleId: result.ruleId,
+                        ruleName: rule?.name || result.ruleId,
+                        message: result.message?.text || result.message?.markdown || '',
+                        location: result.locations?.[0]?.physicalLocation || null,
+                        securitySeverity: securitySeverity || 'unknown'
+                      });
+                      filteredIssues++;
+                    }
+                    
+                    allResults.push({
+                      ruleId: result.ruleId,
+                      ruleName: rule?.name || result.ruleId,
+                      message: result.message?.text || result.message?.markdown || '',
+                      location: result.locations?.[0]?.physicalLocation || null,
+                      securitySeverity: securitySeverity || 'unknown'
+                    });
+                  }
+                  
+                  filteredResults.push(...fileFilteredResults);
+                  
+                  // Add to step summary if there are filtered results
+                  if (fileFilteredResults.length > 0) {
+                    stepSummaryContent += `### Issues in ${fileName}\n\n`;
+                    for (const result of fileFilteredResults) {
+                      const file = result.location?.artifactLocation?.uri || 'unknown';
+                      const line = result.location?.region?.startLine || 0;
+                      stepSummaryContent += `- **${result.ruleId}**: ${result.message} at ${file}:${line}\n`;
+                    }
+                    stepSummaryContent += '\n';
+                  }
+                  
+                } catch (error) {
+                  console.error(`Error processing ${sarifFile}:`, error);
+                }
+              }
+              
+              // Write step summary
+              if (stepSummaryContent && stepSummaryPath) {
+                fs.appendFileSync(stepSummaryPath, stepSummaryContent, 'utf8');
+                console.log('Added results to step summary');
+              } else if (stepSummaryContent) {
+                console.log('Step summary content generated but GITHUB_STEP_SUMMARY not available');
+                console.log(stepSummaryContent);
+              }
+              
+              console.log(`Found ${totalIssues} total issues, ${filteredIssues} filtered issues`);
+              
+              alertsJson = JSON.stringify(filteredResults);
+              totalCount = totalIssues;
+              filteredCount = filteredIssues;
+            }
+          }
           
           console.log(`Setting outputs: alerts=${alertsJson.substring(0, 100)}..., total-count=${totalCount}, filtered-count=${filteredCount}`);
           
@@ -81,7 +274,6 @@ runs:
           core.exportVariable('FILTERED_COUNT', filteredCount.toString());
           
           // Write alerts data to file for programmatic access
-          const fs = require('fs');
           fs.writeFileSync('alerts_data.json', alertsJson, 'utf8');
           console.log('Wrote alerts data to alerts_data.json');
 

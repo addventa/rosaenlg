@@ -51,8 +51,9 @@ jobs:
   codeql-analysis:
     name: Run CodeQL Analysis
     needs: get-query-info
-    uses: ./.github/workflows/codeql_branch_analysis.yml
+    uses: ./.github/workflows/codeql_branch_scan.yml
     with:
+      upload: false
       branch: ${{ needs.get-query-info.outputs.branch-name }}
       severity: 'high,critical'
       query-id: ${{ needs.get-query-info.outputs.query-id }}
@@ -87,12 +88,71 @@ jobs:
             const queryId = '${{ needs.get-query-info.outputs.query-id }}';
             let resolved = false;
             
+            // Log current working directory structure (recursive, all levels)
+            console.log(`Current working directory: ${process.cwd()}`);
+            
+            // Log immediate subdirectories and files in pwd
+            try {
+              const items = fs.readdirSync(process.cwd());
+              const dirs = [];
+              const files = [];
+              
+              for (const item of items) {
+                const fullPath = path.join(process.cwd(), item);
+                try {
+                  const stat = fs.statSync(fullPath);
+                  if (stat.isDirectory()) {
+                    dirs.push(item);
+                  } else if (stat.isFile()) {
+                    files.push(item);
+                  }
+                } catch (err) {
+                  // Skip items we can't stat
+                }
+              }
+              
+              console.log('Subdirectories in pwd:', dirs.sort().join(', ') || '(none)');
+              console.log('Files in pwd:', files.sort().join(', ') || '(none)');
+            } catch (error) {
+              console.log(`Error listing pwd contents: ${error.message}`);
+            }
+            
+            
             // Read CodeQL analysis results from downloaded artifacts
-            const resultsPath = path.join(process.cwd(), 'codeql-results', 'codeql-results.json');
+            const sarifPath = path.join(process.cwd(), 'codeql-results',  'javascript.sarif');
+            
+            // Check if file exists
+            if (!fs.existsSync(sarifPath)) {
+              throw new Error(`CodeQL results file not found at: ${sarifPath}`);
+            }
             
             try {
-              const analysisResults = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
-              const totalResults = analysisResults.summary?.totalResults || 0;
+              // Read and parse SARIF file
+              const sarifData = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
+              
+              // Extract results from SARIF format
+              let totalResults = 0;
+              const results = [];
+              
+              if (sarifData.runs && sarifData.runs.length > 0) {
+                for (const run of sarifData.runs) {
+                  if (run.results && run.results.length > 0) {
+                    totalResults += run.results.length;
+                    for (const result of run.results) {
+                    console.log(result);
+                      results.push({
+                        ruleId: result.ruleId,
+                        message: result.message?.text || result.message?.markdown || ''
+                      });
+                    }
+                  }
+                }
+              }
+              
+              const analysisResults = {
+                summary: { totalResults },
+                results: results
+              };
               
               console.log(`CodeQL analysis found ${totalResults} results`);
               
@@ -120,16 +180,6 @@ jobs:
               }
             } catch (error) {
               console.log('Could not read analysis results, falling back to API check:', error.message);
-              
-              // Fallback to API check
-              const alert = await github.rest.codeScanning.getAlert({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                alert_number: alertId
-              });
-              
-              resolved = alert.data.state === 'fixed' || alert.data.state === 'dismissed';
-              console.log(`API check: vulnerability resolved = ${resolved}`);
             }
             
             core.setOutput('resolved', resolved);
