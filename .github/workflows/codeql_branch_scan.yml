@@ -73,7 +73,8 @@ jobs:
           ${{ inputs.query-id-restriction && format('query-filters:
             - include:
                 id: {0}', inputs.query-id-restriction) || '' }}
-          ${{ inputs.package-path-restriction && format('package-path: {0}', inputs.package-path-restriction) || '' }}
+          ${{ inputs.package-path-restriction && format('paths:
+            - {0}', inputs.package-path-restriction) || '' }}
 
     # If the analyze step fails for one of the languages you are analyzing with
     # "We were unable to automatically build your code", modify the matrix above

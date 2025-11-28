@@ -18,13 +18,7 @@ outputs:
     description: 'true if the alert still exists in the repository'
   state:
     description: 'Current alert state (open, fixed, dismissed, etc.)'
-  rule-id:
-    description: 'Rule identifier for the alert'
-  severity:
-    description: 'Security severity level of the alert rule'
-  html-url:
-    description: 'URL to the alert in the GitHub UI'
-
+    
 runs:
   using: 'composite'
   steps:
@@ -39,8 +33,9 @@ runs:
           const branchRef = rawBranch.startsWith('refs/') ? rawBranch : `refs/heads/${rawBranch}`;
           
           if (Number.isNaN(alertId)) {
-            core.setFailed('Input alert-id must be a valid number');
-            return;
+            const errorMsg = 'Input alert-id must be a valid number';
+            core.setFailed(errorMsg);
+            throw new Error(errorMsg);
           }
           
           console.log(`Checking CodeQL alert #${alertId} on branch ${branchRef} in ${context.repo.owner}/${context.repo.repo}`);
@@ -55,35 +50,31 @@ runs:
             
             const alert = response.data;
             const result = {
-            
               exists: true,
               state: alert.state || 'unknown',
-              ruleId: alert.rule?.id || 'unknown',
-              severity: alert.rule?.security_severity_level || alert.rule?.severity || 'unknown',
-              htmlUrl: alert.html_url || alert.url
             };
             
             console.log(`Alert found: state=${result.state}, rule=${result.ruleId}, severity=${result.severity}`);
             
-            core.setOutput('exists', 'true');
-            core.setOutput('state', result.state);
-            core.setOutput('rule-id', result.ruleId);
-            core.setOutput('severity', result.severity);
-            core.setOutput('html-url', result.htmlUrl || '');
+            return "true";
+
           } catch (error) {
             if (error.status === 404) {
               console.log(`Alert #${alertId} was not found on branch ${branchRef}.`);
-              core.setOutput('exists', 'false');
-              core.setOutput('state', 'missing');
-              core.setOutput('rule-id', '');
-              core.setOutput('severity', '');
-              core.setOutput('html-url', '');
               
               if (failOnMissing) {
                 core.setFailed(`Alert #${alertId} not found and fail-on-missing is true.`);
+                return "false";
               }
             } else {
               core.setFailed(`Failed to fetch alert #${alertId}: ${error.message}`);
+                return "false";
             }
           }
-
+    
+    - name: Set composite action outputs
+      shell: bash
+      if: steps.check-alert.outcome == 'success'
+      run: |
+        echo "exists: ${{ steps.check-alert.outputs.result }}"
+        echo 'exists=${{ steps.check-alert.outputs.result }}' >> $GITHUB_OUTPUT

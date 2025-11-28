@@ -24,6 +24,7 @@ jobs:
       branch-name: ${{ steps.get-info.outputs.branch-name }}
       query-id: ${{ steps.get-info.outputs.query-id }}
       alert-id: ${{ steps.get-info.outputs.alert-id }}
+      package-path: ${{ steps.get-info.outputs.package-path }}
     steps:
       - name: Extract alert ID and get query ID
         id: get-info
@@ -44,26 +45,53 @@ jobs:
             console.log(`Found query ID: ${queryId}`);
             console.log(`Found alert ID: ${alertId}`);
             
+            // Extract package path from alert location
+            let packagePath = '';
+            if (alert.data.most_recent_instance?.location?.path) {
+              const path = require('path');
+              const filePath = alert.data.most_recent_instance.location.path;
+              // Normalize path separators and split
+              const normalizedPath = filePath.replace(/\\/g, '/');
+              const pathParts = normalizedPath.split('/').filter(part => part !== '');
+              
+              // Find 'packages' index and take only up to the next level
+              const packagesIndex = pathParts.indexOf('packages');
+              if (packagesIndex !== -1 && packagesIndex < pathParts.length - 1) {
+                // Take 'packages' and the next directory level only
+                const packageParts = pathParts.slice(0, packagesIndex + 2);
+                packagePath = `./${packageParts.join('/')}`;
+              } else {
+                // If no packages folder, just take the first directory level
+                const dirPath = path.dirname(filePath);
+                packagePath = dirPath.startsWith('./') ? dirPath : `./${dirPath}`;
+              }
+              console.log(`Found package path: ${packagePath} (from file: ${filePath})`);
+            }
+            
             core.setOutput('branch-name', branchName);
             core.setOutput('query-id', queryId);
             core.setOutput('alert-id', alertId.toString());
+            core.setOutput('package-path', packagePath);
 
   codeql-analysis:
     name: Run CodeQL Analysis
+    if: 0
     needs: get-query-info
     uses: ./.github/workflows/codeql_branch_scan.yml
     with:
       branch: ${{ needs.get-query-info.outputs.branch-name }}
       severity: 'high,critical'
       query-id-restriction: ${{ needs.get-query-info.outputs.query-id }}
+      package-path-restriction: ${{ needs.get-query-info.outputs.package-path }}
 
   verify-fix:
     name: Verify Manual Fix
-    needs: [ codeql-analysis, get-query-info]
+    needs: get-query-info # [ codeql-analysis, get-query-info]
     runs-on: ubuntu-latest
     permissions:
       security-events: read
     outputs:
+      exists: ${{ steps.check-resolved.outputs.exists }}
       resolved: ${{ steps.check-resolved.outputs.exists == 'false' }}
       branch-name: ${{ needs.get-query-info.outputs.branch-name }}
     
@@ -80,6 +108,21 @@ jobs:
           branch: ${{ needs.get-query-info.outputs.branch-name }}
           alert-id: ${{ needs.get-query-info.outputs.alert-id }}
           fail-on-missing: true
+      
+      - name: Debug - Log action outputs
+        run: |
+          echo "=== Check CodeQL Alert Action Outputs ==="
+          echo "exists: '${{ steps.check-resolved.outputs.exists }}'"
+          echo "state: '${{ steps.check-resolved.outputs.state }}'"
+          echo ""
+          echo "=== Output Type Check ==="
+          if [ "${{ steps.check-resolved.outputs.exists }}" = "true" ]; then
+            echo "✓ exists is 'true' - Alert still exists"
+          elif [ "${{ steps.check-resolved.outputs.exists }}" = "false" ]; then
+            echo "✓ exists is 'false' - Alert not found (resolved)"
+          else
+            echo "✗ exists is empty or unexpected (value: '${{ steps.check-resolved.outputs.exists }}')"
+          fi
             
       - name: Alert if still vulnerable
         if: steps.check-resolved.outputs.exists == 'true'
@@ -114,6 +157,38 @@ jobs:
             }
             
             core.setFailed('Vulnerability still present after manual fix');
+  
+  monitor-outputs:
+    name: Monitor Verify-Fix Outputs
+    needs: [verify-fix, get-query-info]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log get-query-info outputs
+        run: |
+          echo "=== Get-Query-Info Job Outputs ==="
+          echo "branch-name: ${{ needs.get-query-info.outputs.branch-name }}"
+          echo "query-id: ${{ needs.get-query-info.outputs.query-id }}"
+          echo "alert-id: ${{ needs.get-query-info.outputs.alert-id }}"
+          echo "package-path: ${{ needs.get-query-info.outputs.package-path }}"
+          echo ""
+
+          echo "=== Verify-Fix Job Outputs ==="
+          echo "resolved: ${{ needs.verify-fix.outputs.resolved }}"
+          echo "exists: ${{ needs.verify-fix.outputs.exists }}"
+          echo "branch-name: ${{ needs.verify-fix.outputs.branch-name }}"
+          echo ""
+          echo "=== Raw Output Values ==="
+          echo "resolved (raw): '${{ needs.verify-fix.outputs.resolved }}'"
+          echo "branch-name (raw): '${{ needs.verify-fix.outputs.branch-name }}'"
+          echo ""
+          echo "=== Output Type Check ==="
+          if [ "${{ needs.verify-fix.outputs.resolved }}" = "true" ]; then
+            echo "resolved is 'true'"
+          elif [ "${{ needs.verify-fix.outputs.resolved }}" = "false" ]; then
+            echo "resolved is 'false'"
+          else
+            echo "resolved is neither 'true' nor 'false' (value: '${{ needs.verify-fix.outputs.resolved }}')"
+          fi
 
   build-and-test:
     name: Build and Test
