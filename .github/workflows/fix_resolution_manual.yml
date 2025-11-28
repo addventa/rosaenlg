@@ -53,10 +53,9 @@ jobs:
     needs: get-query-info
     uses: ./.github/workflows/codeql_branch_scan.yml
     with:
-      upload: false
       branch: ${{ needs.get-query-info.outputs.branch-name }}
       severity: 'high,critical'
-      query-id: ${{ needs.get-query-info.outputs.query-id }}
+      query-id-restriction: ${{ needs.get-query-info.outputs.query-id }}
 
   verify-fix:
     name: Verify Manual Fix
@@ -65,128 +64,25 @@ jobs:
     permissions:
       security-events: read
     outputs:
-      resolved: ${{ steps.check-resolved.outputs.resolved }}
+      resolved: ${{ steps.check-resolved.outputs.exists == 'false' }}
       branch-name: ${{ needs.get-query-info.outputs.branch-name }}
     
     steps:
-
-      - name: Download CodeQL Analysis Results
-        uses: actions/download-artifact@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          name: codeql-analysis-results
-          path: codeql-results
+          ref: ${{ needs.get-query-info.outputs.branch-name }}
 
       - name: Check if vulnerability resolved
         id: check-resolved
-        uses: actions/github-script@v7
+        uses: ./.github/actions/check_codeql_alert
         with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            
-            const alertId = ${{ needs.get-query-info.outputs.alert-id }};
-            const queryId = '${{ needs.get-query-info.outputs.query-id }}';
-            let resolved = false;
-            
-            // Log current working directory structure (recursive, all levels)
-            console.log(`Current working directory: ${process.cwd()}`);
-            
-            // Log immediate subdirectories and files in pwd
-            try {
-              const items = fs.readdirSync(process.cwd());
-              const dirs = [];
-              const files = [];
-              
-              for (const item of items) {
-                const fullPath = path.join(process.cwd(), item);
-                try {
-                  const stat = fs.statSync(fullPath);
-                  if (stat.isDirectory()) {
-                    dirs.push(item);
-                  } else if (stat.isFile()) {
-                    files.push(item);
-                  }
-                } catch (err) {
-                  // Skip items we can't stat
-                }
-              }
-              
-              console.log('Subdirectories in pwd:', dirs.sort().join(', ') || '(none)');
-              console.log('Files in pwd:', files.sort().join(', ') || '(none)');
-            } catch (error) {
-              console.log(`Error listing pwd contents: ${error.message}`);
-            }
-            
-            
-            // Read CodeQL analysis results from downloaded artifacts
-            const sarifPath = path.join(process.cwd(), 'codeql-results',  'javascript.sarif');
-            
-            // Check if file exists
-            if (!fs.existsSync(sarifPath)) {
-              throw new Error(`CodeQL results file not found at: ${sarifPath}`);
-            }
-            
-            try {
-              // Read and parse SARIF file
-              const sarifData = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
-              
-              // Extract results from SARIF format
-              let totalResults = 0;
-              const results = [];
-              
-              if (sarifData.runs && sarifData.runs.length > 0) {
-                for (const run of sarifData.runs) {
-                  if (run.results && run.results.length > 0) {
-                    totalResults += run.results.length;
-                    for (const result of run.results) {
-                    console.log(result);
-                      results.push({
-                        ruleId: result.ruleId,
-                        message: result.message?.text || result.message?.markdown || ''
-                      });
-                    }
-                  }
-                }
-              }
-              
-              const analysisResults = {
-                summary: { totalResults },
-                results: results
-              };
-              
-              console.log(`CodeQL analysis found ${totalResults} results`);
-              
-              // If no results found, vulnerability is resolved
-              if (totalResults === 0) {
-                resolved = true;
-                console.log('No vulnerabilities found in analysis - vulnerability is resolved');
-              } else if (queryId && analysisResults.results) {
-                // Check if the specific query/rule is still present
-                const matchingResults = analysisResults.results.filter(r => 
-                  r.ruleId === queryId || r.ruleId.includes(queryId)
-                );
-                
-                console.log(`Found ${matchingResults.length} results matching query ${queryId}`);
-                resolved = matchingResults.length === 0;
-                
-                if (resolved) {
-                  console.log('No matching results found - vulnerability is resolved');
-                } else {
-                  console.log('Matching results found - vulnerability still present');
-                }
-              } else {
-                // If we can't match by query ID, check if any results exist
-                resolved = totalResults === 0;
-              }
-            } catch (error) {
-              console.log('Could not read analysis results, falling back to API check:', error.message);
-            }
-            
-            core.setOutput('resolved', resolved);
-            console.log(`Final result: vulnerability resolved = ${resolved}`);
+          branch: ${{ needs.get-query-info.outputs.branch-name }}
+          alert-id: ${{ needs.get-query-info.outputs.alert-id }}
+          fail-on-missing: true
             
       - name: Alert if still vulnerable
-        if: steps.check-resolved.outputs.resolved != 'true'
+        if: steps.check-resolved.outputs.exists == 'true'
         uses: actions/github-script@v7
         with:
           script: |

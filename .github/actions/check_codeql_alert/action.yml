@@ -1,0 +1,89 @@
+name: 'Check CodeQL Alert Status'
+description: 'Verify whether a specific CodeQL alert still exists and report its status'
+
+inputs:
+  branch:
+    description: 'Branch to check (with or without refs/heads/)'
+    required: true
+  alert-id:
+    description: 'Numeric CodeQL alert identifier'
+    required: true
+  fail-on-missing:
+    description: 'If true, fail when the alert cannot be found'
+    required: false
+    default: true
+
+outputs:
+  exists:
+    description: 'true if the alert still exists in the repository'
+  state:
+    description: 'Current alert state (open, fixed, dismissed, etc.)'
+  rule-id:
+    description: 'Rule identifier for the alert'
+  severity:
+    description: 'Security severity level of the alert rule'
+  html-url:
+    description: 'URL to the alert in the GitHub UI'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check alert status
+      uses: actions/github-script@v7
+      id: check-alert
+      with:
+        script: |
+          const failOnMissing = '${{ inputs['fail-on-missing'] }}' === 'true';
+          const alertId = parseInt('${{ inputs['alert-id'] }}', 10);
+          const rawBranch = '${{ inputs.branch }}'.trim();
+          const branchRef = rawBranch.startsWith('refs/') ? rawBranch : `refs/heads/${rawBranch}`;
+          
+          if (Number.isNaN(alertId)) {
+            core.setFailed('Input alert-id must be a valid number');
+            return;
+          }
+          
+          console.log(`Checking CodeQL alert #${alertId} on branch ${branchRef} in ${context.repo.owner}/${context.repo.repo}`);
+          
+          try {
+            const response = await github.rest.codeScanning.getAlert({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              alert_number: alertId,
+              ref: branchRef
+            });
+            
+            const alert = response.data;
+            const result = {
+            
+              exists: true,
+              state: alert.state || 'unknown',
+              ruleId: alert.rule?.id || 'unknown',
+              severity: alert.rule?.security_severity_level || alert.rule?.severity || 'unknown',
+              htmlUrl: alert.html_url || alert.url
+            };
+            
+            console.log(`Alert found: state=${result.state}, rule=${result.ruleId}, severity=${result.severity}`);
+            
+            core.setOutput('exists', 'true');
+            core.setOutput('state', result.state);
+            core.setOutput('rule-id', result.ruleId);
+            core.setOutput('severity', result.severity);
+            core.setOutput('html-url', result.htmlUrl || '');
+          } catch (error) {
+            if (error.status === 404) {
+              console.log(`Alert #${alertId} was not found on branch ${branchRef}.`);
+              core.setOutput('exists', 'false');
+              core.setOutput('state', 'missing');
+              core.setOutput('rule-id', '');
+              core.setOutput('severity', '');
+              core.setOutput('html-url', '');
+              
+              if (failOnMissing) {
+                core.setFailed(`Alert #${alertId} not found and fail-on-missing is true.`);
+              }
+            } else {
+              core.setFailed(`Failed to fetch alert #${alertId}: ${error.message}`);
+            }
+          }
+

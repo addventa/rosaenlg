@@ -13,16 +13,21 @@ on:
         type: string
         description: 'Severity filter - affects which query packs are used (high/critical = security-extended, all = security-and-quality)'
         default: 'high,critical'
-      query-id:
+      query-id-restriction:
         required: false
         type: string
         description: 'Specific CodeQL query/rule ID to scan (e.g., javascript/example/rule-name). If provided, only this query will be run.'
+        default: ''
+      package-path-restriction:
+        required: false
+        type: string
+        description: 'Path to the package.json file'
         default: ''
       upload:
         required: false
         type: boolean
         description: 'Whether to upload results to GitHub Security'
-        default: false
+        default: true
 
 jobs:
   analyze:
@@ -65,9 +70,10 @@ jobs:
         build-mode: none
         config-file: ./.github/codeql/codeql-config.yml
         config: |
-          ${{ inputs.query-id && format('query-filters:
+          ${{ inputs.query-id-restriction && format('query-filters:
             - include:
-                id: {0}', inputs.query-id) || '' }}
+                id: {0}', inputs.query-id-restriction) || '' }}
+          ${{ inputs.package-path-restriction && format('package-path: {0}', inputs.package-path-restriction) || '' }}
 
     # If the analyze step fails for one of the languages you are analyzing with
     # "We were unable to automatically build your code", modify the matrix above
