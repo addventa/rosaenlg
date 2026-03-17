@@ -1,0 +1,212 @@
+# .github/workflows/merge_fix_to_campaign.yml
+name: Merge Fix Branch to Campaign
+
+on:
+  workflow_call:
+    inputs:
+      target-branch:
+        description: 'Target branch the campaign branch is based from'
+        required: true
+        type: string
+      fix-branch-name:
+        description: 'The fix branch to merge into the campaign branch'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  merge-fix:
+    name: Merge Fix Branch via PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Campaign Info
+        id: campaign
+        uses: addventa/.github/.github/actions/campaign/get_campaign_info@v3
+      - name: Create PR and merge fix branch into campaign
+        uses: actions/github-script@v7
+        env:
+          CAMPAIGN_BRANCH: ${{ steps.campaign.outputs.branch-name }}
+          CAMPAIGN_LABEL: ${{ steps.campaign.outputs.campaign-label }}
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+          FIX_BRANCH_NAME: ${{ inputs.fix-branch-name }}
+        with:
+          script: |
+            const fixBranchName = process.env.FIX_BRANCH_NAME;
+            const targetBranch = process.env.TARGET_BRANCH;
+            const campaignBranchName = process.env.CAMPAIGN_BRANCH;
+            const campaignLabel = process.env.CAMPAIGN_LABEL;
+
+            console.log(`Fix branch: ${fixBranchName}`);
+            console.log(`Campaign branch: ${campaignBranchName}`);
+            console.log(`Target branch: ${targetBranch}`);
+            console.log(`Campaign label: ${campaignLabel}`);
+
+            // Find the issue related to this fix branch
+            const openIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: `codeql,${campaignLabel}`
+            });
+
+            const relatedIssue = openIssues.data.find(issue =>
+              issue.body && issue.body.includes(`\`${fixBranchName}\``)
+            );
+
+            if (!relatedIssue) {
+              console.log(`No open issue found referencing fix branch ${fixBranchName}. Skipping.`);
+              return;
+            }
+
+            console.log(`Found related issue #${relatedIssue.number}: ${relatedIssue.title}`);
+
+            // Ensure campaign branch exists (created by create_security_campaign action)
+            try {
+              await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: campaignBranchName
+              });
+              console.log(`Campaign branch ${campaignBranchName} exists`);
+            } catch (error) {
+              if (error.status === 404) {
+                throw new Error(`Campaign branch ${campaignBranchName} does not exist. Run the Global Fix Trigger workflow first to create the campaign.`);
+              }
+              throw error;
+            }
+
+            // Check fix branch exists and has commits to merge
+            let fixBranchSha;
+            try {
+              const fixBranchInfo = await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: fixBranchName
+              });
+              fixBranchSha = fixBranchInfo.data.commit.sha;
+              console.log(`Fix branch SHA: ${fixBranchSha}`);
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(`Fix branch ${fixBranchName} not found. Skipping.`);
+                return;
+              }
+              throw error;
+            }
+
+            // Compare fix branch to target branch
+            const fixVsTarget = await github.rest.repos.compareCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              base: targetBranch,
+              head: fixBranchName
+            });
+            console.log(`Fix branch vs ${targetBranch}: ahead by ${fixVsTarget.data.ahead_by}, behind by ${fixVsTarget.data.behind_by}`);
+
+            if (fixVsTarget.data.ahead_by === 0) {
+              console.log(`WARNING: ${fixBranchName} has NO commits ahead of ${targetBranch} - nothing to merge!`);
+              return;
+            }
+
+            // Log the commits that will be merged
+            console.log(`Commits to merge from ${fixBranchName}:`);
+            for (const commit of fixVsTarget.data.commits) {
+              console.log(`  - ${commit.sha.substring(0, 7)}: ${commit.commit.message.split('\n')[0]}`);
+            }
+
+            // Check if there's already an open PR for this fix branch to campaign branch
+            const existingPRs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              head: `${context.repo.owner}:${fixBranchName}`,
+              base: campaignBranchName
+            });
+
+            let pr;
+            if (existingPRs.data.length > 0) {
+              pr = existingPRs.data[0];
+              console.log(`Found existing PR #${pr.number} for ${fixBranchName} -> ${campaignBranchName}`);
+            } else {
+              // Create PR from fix branch to campaign branch
+              console.log(`Creating PR: ${fixBranchName} -> ${campaignBranchName}`);
+              try {
+                const newPR = await github.rest.pulls.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `Merge ${fixBranchName} (issue #${relatedIssue.number}): ${relatedIssue.title}`,
+                  head: fixBranchName,
+                  base: campaignBranchName,
+                  body: `Automated PR to merge fix branch \`${fixBranchName}\` into campaign consolidation branch.\n\nRelated issue: #${relatedIssue.number}`
+                });
+                pr = newPR.data;
+                console.log(`Created PR #${pr.number}`);
+              } catch (prError) {
+                if (prError.message && prError.message.includes('No commits between')) {
+                  console.log(`No commits to merge from ${fixBranchName} - already up to date`);
+                  return;
+                }
+                throw prError;
+              }
+            }
+
+            // Merge the PR (creates a merge commit, PR auto-closes on merge)
+            try {
+              const mergeResult = await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                merge_method: 'merge',
+                commit_title: `Merge ${fixBranchName} (issue #${relatedIssue.number}): ${relatedIssue.title}`,
+                commit_message: `Merging fix branch into campaign consolidation.\n\nRelated issue: #${relatedIssue.number}`
+              });
+
+              if (mergeResult.data.merged) {
+                console.log(`Successfully merged PR #${pr.number} - SHA: ${mergeResult.data.sha}`);
+
+                // Update the related issue: replace 'pending' label with 'merged'
+                try {
+                  const currentLabels = relatedIssue.labels.map(l => typeof l === 'string' ? l : l.name);
+                  const newLabels = currentLabels.filter(l => l !== 'pending');
+                  if (!newLabels.includes('merged')) {
+                    newLabels.push('merged');
+                  }
+
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: relatedIssue.number,
+                    labels: newLabels
+                  });
+
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: relatedIssue.number,
+                    body: `✅ Fix has been merged into campaign consolidation branch \`${campaignBranchName}\` via PR #${pr.number}.\n\nMerge commit: ${mergeResult.data.sha}`
+                  });
+
+                  console.log(`Updated issue #${relatedIssue.number}: replaced 'pending' label with 'merged'`);
+                } catch (issueError) {
+                  console.log(`Warning: Could not update issue #${relatedIssue.number}: ${issueError.message}`);
+                }
+              } else {
+                console.log(`PR #${pr.number} merge returned but not merged: ${mergeResult.data.message}`);
+              }
+            } catch (mergeError) {
+              if (mergeError.status === 405 || mergeError.status === 409) {
+                console.log(`PR #${pr.number} has conflicts or is not mergeable: ${mergeError.message}`);
+                core.setFailed(`Could not merge ${fixBranchName}: conflicts or checks failing`);
+              } else {
+                throw mergeError;
+              }
+            }
+
+

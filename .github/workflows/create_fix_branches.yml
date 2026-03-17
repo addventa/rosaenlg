@@ -1,0 +1,228 @@
+name: Create Fix Branches and Issues (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        description: 'Branch name to create fix branches from'
+      severity:
+        required: true
+        type: string
+        description: 'Severity level(s) to filter (e.g., "high,critical" or "critical")'
+    outputs:
+      has-alerts:
+        description: 'true when filtered-count > 0'
+        value: ${{ jobs.create-fix-artefacts.outputs['has-alerts'] }}
+      alerts-ids: 
+        description: 'List of alert IDs'
+        value: ${{ jobs.create-fix-artefacts.outputs['alerts-ids'] }}
+
+permissions:
+  contents: write  # Required to create branches
+  security-events: write  # Required to update alerts (assign branches)
+  issues: write
+  pull-requests: write
+
+jobs:
+  create-fix-artefacts:
+    name: Create Fix Branches and Issues Artefacts
+    runs-on: ubuntu-latest
+    outputs:
+      filtered-count: ${{ steps.log-found-alerts.outputs['filtered-count'] }}
+      has-alerts: ${{ steps.log-found-alerts.outputs['filtered-count'] != '0' }}
+      alerts-ids: ${{ steps.log-found-alerts.outputs['alerts-ids'] }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+            
+      - name: Log Found Alerts
+        id: log-found-alerts
+        uses: addventa/.github/.github/actions/alerts/log_codeql_alerts@v3
+        with:
+          branch: ${{ inputs.branch }}
+          severity: ${{ inputs.severity }}
+          upload: true
+
+      - name: Get Campaign Info
+        id: campaign-info
+        uses: addventa/.github/.github/actions/campaign/get_campaign_info@v3
+      - name: Create Fix Issues and Prepare Branch Tasks
+        uses: actions/github-script@v8
+        env:
+          CAMPAIGN_LABEL: ${{ steps.campaign-info.outputs.campaign-label }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Read alerts
+            const alertsFilePath = path.join(process.cwd(), 'alerts_data.json');
+            let alertsData;
+            try {
+              alertsData = fs.readFileSync(alertsFilePath, 'utf8').trim();
+            } catch (error) {
+              console.error('Failed to read alerts data file:', error);
+              return;
+            }
+
+            const campaignLabel = process.env.CAMPAIGN_LABEL;
+            console.log('Campaign label:', campaignLabel);
+            
+            let alerts;
+            try {
+              alerts = JSON.parse(alertsData);
+            } catch (error) {
+              console.error('Failed to parse alerts data:', error);
+              return;
+            }
+            
+            if (alerts.length === 0) {
+              console.log('No alerts found. Skipping artifact creation.');
+              fs.writeFileSync('branch_tasks.json', '[]'); // Write empty array
+              return;
+            }
+            
+            console.log(`Processing ${alerts.length} alerts...`);
+            const tasks = [];
+
+            for (const alert of alerts) {
+              const issueTitle = `[CodeQL][${campaignLabel}][Security Alert ${alert.number}] Vulnerability: ${alert.rule.description}`;
+              const branchName = `fix-codeql-alert-${alert.number}`;
+              
+              // Find or Create Issue
+              const existingIssues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                creator: 'app/github-actions', 
+                labels: ['codeql', campaignLabel, `alert:${alert.number}`] 
+              });
+              
+              let issue = existingIssues.data.length > 0 ? existingIssues.data[0] : null;
+
+              if (!issue) {
+                // Create issue content
+                const issueBody = [
+                  '## Vulnerability Details',
+                  '',
+                  `**Alert ID:** ${alert.number}`,
+                  `**Rule:** ${alert.rule.id}`,
+                  `**Severity:** ${alert.rule.security_severity_level}`,
+                  `**Description:** ${alert.rule.description}`,
+                  '',
+                  `**Location:** ${alert.most_recent_instance.location.path}:${alert.most_recent_instance.location.start_line}`,
+                  '',
+                  `**Source Branch:** \`${{ inputs.branch }}\``,
+                  `**Severity Filter:** \`${{ inputs.severity }}\``,
+                  `**Fix Branch:** \`${branchName}\``,
+                  '',
+                  'This issue was automatically created by the vulnerability detection workflow.',
+                  '',
+                  `[View Alert](${alert.html_url})`
+                ].join('\n');
+
+                const labels = ['security', 'codeql', campaignLabel, 'automated-fix', `alert:${alert.number}`];
+                const severityLabel = alert.rule?.security_severity_level?.toLowerCase() || 'unknown';
+                if (severityLabel && !labels.includes(severityLabel)) {
+                  labels.push(`severity:${severityLabel}`);
+                }
+                
+                // Add pkg label
+                const locationPath = alert.most_recent_instance.location.path;
+                if (locationPath) {
+                  const pathParts = locationPath.split('/');
+                  if (pathParts.length >= 2 && pathParts[0] === 'packages') {
+                    labels.push(`pkg:${pathParts[1]}`);
+                  }
+                }
+
+                const createdIssue = await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: issueTitle,
+                  body: issueBody,
+                  labels: labels
+                });
+                issue = createdIssue.data;
+                console.log(`Created issue ${issue.number} for alert ${alert.number}`);
+              } else {
+                console.log(`Issue ${issue.number} already exists for alert ${alert.number}`);
+              }
+
+              // Add to tasks list for next step
+              tasks.push({
+                issue_number: issue.number,
+                branch_name: branchName,
+                base_branch: '${{ inputs.branch }}'
+              });
+            }
+            
+            // Write tasks to file
+            fs.writeFileSync('branch_tasks.json', JSON.stringify(tasks, null, 2));
+            console.log(`Prepared ${tasks.length} branch creation tasks.`);
+
+      - name: Create Fix Branches with GH CLI
+        # switch to bash and GH CLI, since issue branch linking for issues doesn't exist in REST API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f branch_tasks.json ]; then
+            echo "No tasks file found."
+            exit 0
+          fi
+          
+          # Iterate through tasks using jq to parse JSON safely
+          count=$(jq '. | length' branch_tasks.json)
+          if [ "$count" -eq "0" ]; then
+            echo "No tasks to process."
+            exit 0
+          fi
+
+          echo "Found $count branches to check/create."
+          
+          # Read JSON array and iterate
+          jq -c '.[]' branch_tasks.json | while read -r task; do
+            ISSUE_NUM=$(echo "$task" | jq -r '.issue_number')
+            BRANCH_NAME=$(echo "$task" | jq -r '.branch_name')
+            BASE_BRANCH=$(echo "$task" | jq -r '.base_branch')
+            
+            echo "----------------------------------------"
+            echo "Processing: Issue #$ISSUE_NUM -> Branch $BRANCH_NAME (base: $BASE_BRANCH)"
+            
+            # Clean up potential malformed git config from previous gh runs
+            if [ -f .git/config ]; then
+              sed -i '/branch\.\.gh-merge-base/d' .git/config
+            fi
+
+            # Check if branch already exists locally or remotely
+            if git ls-remote --exit-code --heads origin "$BRANCH_NAME" > /dev/null; then
+              echo "Branch $BRANCH_NAME already exists (remote). Skipping."
+              continue
+            fi
+            
+            # Use gh issue develop to create branch linked to issue
+            echo "Running: gh issue develop $ISSUE_NUM --name \"$BRANCH_NAME\" --base \"$BASE_BRANCH\" --checkout=false"
+            
+            if gh issue develop "$ISSUE_NUM" --name "$BRANCH_NAME" --base "$BASE_BRANCH" --checkout=false; then
+              echo "Successfully created and linked branch $BRANCH_NAME to Issue #$ISSUE_NUM"
+              
+              # Create a tag with the same name as the branch
+              echo "Creating tag $BRANCH_NAME..."
+              git fetch origin "$BRANCH_NAME" # Ensure we know about the new branch
+              git tag "$BRANCH_NAME" "origin/$BRANCH_NAME"
+              if git push origin "$BRANCH_NAME"; then
+                  echo "Successfully created and pushed tag $BRANCH_NAME"
+              else
+                  echo "Failed to push tag $BRANCH_NAME"
+              fi
+            else
+              echo "Failed to create branch for Issue #$ISSUE_NUM"
+              # Don't fail the whole job, continue to next
+            fi
+            
+          done
+
+

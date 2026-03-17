@@ -1,0 +1,121 @@
+# .github/workflows/01-global-fix-trigger.yml
+name: Global Fix Trigger - Scheduled Vulnerability Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      target-branch:
+        description: 'Target branch for the security campaign'
+        required: true
+        type: string
+        default: 'codeql-advanced-configuration'
+  schedule:
+    # Exécution quotidienne à 2h du matin
+    - cron: '31 19 1 * *'
+
+env:
+  TARGET_BRANCH: 'codeql-advanced-configuration'
+  
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+  actions: read
+  packages: read
+
+jobs:
+  campaign-info:
+    name: Get Campaign Info
+    runs-on: ubuntu-latest
+    outputs:
+      campaign-name: ${{ steps.get-campaign-info.outputs.campaign-name }}
+      campaign-label: ${{ steps.get-campaign-info.outputs.campaign-label }}
+      quarter: ${{ steps.get-campaign-info.outputs.quarter }}
+      year: ${{ steps.get-campaign-info.outputs.year }}
+      quarter-end: ${{ steps.get-campaign-info.outputs.quarter-end }}
+      branch-name: ${{ steps.get-campaign-info.outputs.branch-name }}
+      target-branch: ${{ steps.config.outputs.branch }}
+      severity: ${{ steps.config.outputs.severity }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Campaign Info
+        id: get-campaign-info
+        uses: addventa/.github/.github/actions/campaign/get_campaign_info@v3
+      - name: Set Configuration
+        id: config
+        run: |
+          echo "branch=${{ env.TARGET_BRANCH }}" >> $GITHUB_OUTPUT
+          
+          # Change this line to set severity filter (affects CodeQL query pack selection)
+          SEVERITY="high,critical"
+          echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+
+  check-repo-ready:
+    name: Check Repository
+    needs: [campaign-info]
+    if: 0
+    uses: ./.github/workflows/check_master_and_branch_alignment.yml
+    secrets: inherit
+    with:
+      branch: ${{ needs.campaign-info.outputs.target-branch }}
+      upstream_repo: "RosaeNLG/RosaeNLG"
+
+  codeql-scan:
+    name: CodeQL Security Scan
+    needs: [campaign-info] #, check-repo-ready]
+    runs-on: ubuntu-latest
+    outputs:
+      has-alerts: ${{ steps.codeql-scan.outputs.has-alerts }}
+      alerts-ids: ${{ steps.codeql-scan.outputs.alerts-ids }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: CodeQL Branch Scan
+        id: codeql-scan
+        uses: addventa/.github/.github/actions/codeql/codeql_branch_scan@v3
+        with:
+          branch: ${{ needs.campaign-info.outputs.target-branch }}
+          severity: ${{ needs.campaign-info.outputs.severity }}
+          upload: true
+
+  create-security-campaign:
+    name: Create Security Campaign
+    needs: [codeql-scan, campaign-info]
+    runs-on: ubuntu-latest
+    if: ${{ needs.codeql-scan.outputs['has-alerts'] == 'true' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.campaign-info.outputs.target-branch }}
+
+      - name: Create Security Campaign
+        id: create-campaign
+        uses: addventa/.github/.github/actions/campaign/create_security_campaign@v3
+        with:
+          name: ${{ needs.campaign-info.outputs.campaign-name }}
+          description: |
+            Regular security update campaign for ${{ needs.campaign-info.outputs.campaign-name }}
+            Automatically created by the CI/CD pipeline.
+          end-date: ${{ needs.campaign-info.outputs.quarter-end }}
+          alerts: ${{ needs.codeql-scan.outputs.alerts-ids }}
+          campaign-label: ${{ needs.campaign-info.outputs.campaign-label }}
+          campaign-branch-name: ${{ needs.campaign-info.outputs.branch-name }}
+          target-branch: ${{ needs.campaign-info.outputs.target-branch }}
+          severity: ${{ needs.campaign-info.outputs.severity }}
+          token: ${{ github.token }}
+
+  create-fix-branches:
+    name: Create Fix Branches and Issues
+    needs: [campaign-info, create-security-campaign]
+    uses: ./.github/workflows/create_fix_branches.yml
+    secrets: inherit
+    with:
+      branch: ${{ needs.campaign-info.outputs.target-branch }}
+      severity: ${{ needs.campaign-info.outputs.severity }}
+
+

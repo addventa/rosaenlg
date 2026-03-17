@@ -1,0 +1,33 @@
+name: 🧹 Reset branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: "Branches a supprimer (ex: release/2.13.2-rev,release/2.13.3-rev)"
+        required: true
+      tags:
+        description: "Tags a supprimer (optionnel, ex: v2.13.2-rev.1,v2.13.2-rev.1-rc.1)"
+        required: false
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Reset remote branches and tags
+        shell: bash
+        run: |
+          # Normalize line endings for the runner's shell
+          sed -i 's/\r$//' ./scripts/reset-remote.sh
+          chmod +x ./scripts/reset-remote.sh
+          args=(--branches "${{ inputs.branches }}")
+          if [[ -n "${{ inputs.tags }}" ]]; then
+            args+=(--tags "${{ inputs.tags }}")
+          fi
+          bash ./scripts/reset-remote.sh "${args[@]}"

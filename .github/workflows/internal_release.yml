@@ -1,0 +1,100 @@
+# .github/workflows/05-internal-release.yml
+name: New Release Production
+
+on:
+  workflow_run:
+    workflows: ["New Version Production DISABLED"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  check-trigger:
+    name: Check Trigger Condition
+    runs-on: ubuntu-latest
+    outputs:
+      base-version: ${{ steps.version.outputs.base-version }}
+      revision-number: ${{ steps.version.outputs.revision-number }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+
+      - name: Determine version from package.json
+        id: version
+        uses: addventa/.github/.github/actions/release/get_current_version@v3
+  verify-release-codeql:
+    name: Verify Release with CodeQL
+    needs: check-trigger
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: scan release branch with CodeQL
+        uses: ./.github/workflows/codeql-branch-scan.yml
+        with:
+          branch: ${{ env.TARGET_BRANCH }}
+          severity: 'high,critical'
+          upload: true
+
+  create-release:
+    name: Create Internal Release
+    needs: [check-trigger, verify-release-codeql]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.merge-fix-branches.outputs.release-branch }}
+
+      - name: Create GitHub Release
+        uses: actions/github-script@v8
+        if: 0
+        with:
+          script: |
+            const version = '${{ needs.merge-fix-branches.outputs.base-version }}-rev.${{ needs.merge-fix-branches.outputs.revision-number }}';
+            const releaseBranch = '${{ needs.merge-fix-branches.outputs.release-branch }}';
+            
+            const releaseBody = [
+              `## Internal Release ${version}`,
+              '',
+              `This is an internal release with security fixes.`,
+              '',
+              `**Security Fixes:**`,
+              `- All known CodeQL vulnerabilities resolved or pending release`,
+              `- Branch: \`${releaseBranch}\``,
+              '',
+              `**Changes:**`,
+              `See merged fix branches for details.`,
+            ].join('\n');
+
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${version}`,
+              target_commitish: releaseBranch,
+              name: `Internal Release v${version}`,
+              body: releaseBody.join('\n')
+              draft: false,
+              prerelease: false
+            });
+
+            console.log(`Created release: ${release.data.html_url}`);
+
+
+  create-docker-image:
+    name: Build and push Docker image
+    if: 0
+    needs: [create-release]
+    uses: ./.github/workflows/docker-image.yml
+    with:
+      services: 'internal'
+

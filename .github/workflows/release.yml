@@ -1,0 +1,79 @@
+name: 🚂 CI - Auto RC & Build
+
+on:
+  push:
+    branches:
+      - "release/*"
+      - "staging/*"
+      - "fix/*"
+  
+
+permissions:
+  contents: write # Nécessaire pour taguer
+  packages: write # Nécessaire pour Docker
+  issues: write   # Nécessaire pour trace_revision_issues (promote_RC autopromote)
+
+jobs:
+  detect-version:
+    name: Detect Version Type
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next-version.outputs.forced-version }}
+      is-final: ${{ steps.current-version.outputs.is-final }}
+      autopromote: ${{ steps.next-version.outputs.autopromote }}
+      autopromote-reason: ${{ steps.next-version.outputs.autopromote-reason }}
+      base-version: ${{ steps.current-version.outputs.base-version }}
+      current-rc: ${{ steps.current-version.outputs.rc }}
+      next-revision: ${{ steps.next-version.outputs.next-revision }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Get current version
+        id: current-version
+        uses: addventa/.github/.github/actions/release/get_current_version@v3
+      - name: Compute next version
+        id: next-version
+        uses: addventa/.github/.github/actions/release/compute_next_version@v3
+        with:
+          base-version: ${{ steps.current-version.outputs.base-version }}
+          current-major: ${{ steps.current-version.outputs.major }}
+          current-minor: ${{ steps.current-version.outputs.minor }}
+          current-patch: ${{ steps.current-version.outputs.patch }}
+          branch-name: ${{ github.ref_name }}
+
+  run-pipeline:
+    name: Run Pipeline
+    needs: detect-version
+    # Skip if current version is already a final release (nothing to do)
+    if: needs.detect-version.outputs.is-final != 'true'
+    uses: addventa/.github/.github/workflows/pipeline-tag-build.yml@v3
+    with:
+      image_name: addventa/addventa-bnppam-commentairesallocation-rosaenlg-main # internal registry repository
+      lang: node
+      build_docker: false # TO DO: push docker once the CI is finalized, currently we only need the tag push to trigger cascade release
+      push_tag: true
+      use_app_token: true  # Use App token for tag push to trigger cascade_patch_release
+      version: ${{ needs.detect-version.outputs.version }}
+    secrets: inherit
+
+
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # AUTOPROMOTE: Automatically promote revisions and RCs from revision cascade
+  #
+  # - Revision case: vX.Y.Z-rev.R-rc.N → vX.Y.Z-rev.R
+  # - RC from revision: vX.Y.Z-rc.N (when content includes revision) → vX.Y.Z
+  # ═══════════════════════════════════════════════════════════════════════
+  autopromote:
+    name: Auto-Promote
+    needs: [detect-version, run-pipeline]
+    if: needs.detect-version.outputs.is-final != 'true' && needs.detect-version.outputs.autopromote == 'true'
+    uses: ./.github/workflows/promote_RC.yml
+    with:
+      rc_tag: v${{ needs.run-pipeline.outputs.version }}
+    secrets: inherit
+

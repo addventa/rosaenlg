@@ -1,0 +1,153 @@
+# .github/workflows/consolidate_campaign.yml
+name: Consolidate Campaign Fixes
+
+on:
+  workflow_call:
+    inputs:
+      target-branch:
+        description: 'Target branch for the final consolidation PR'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  consolidate:
+    name: Check Campaign and Create Consolidation PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get Campaign Info
+        id: campaign-info
+        uses: addventa/.github/.github/actions/campaign/get_campaign_info@v3
+      - name: Check campaign issues status
+        id: check-status
+        uses: addventa/.github/.github/actions/campaign/check_campaign_status@v3
+        with:
+          campaign-label: ${{ steps.campaign-info.outputs.campaign-label }}
+          campaign-name: ${{ steps.campaign-info.outputs.campaign-name }}
+
+      - name: Create consolidation PR
+        if: steps.check-status.outputs.all-merged == 'true'
+        uses: actions/github-script@v7
+        env:
+          CAMPAIGN_BRANCH: ${{ steps.campaign-info.outputs.branch-name }}
+          CAMPAIGN_LABEL: ${{ steps.campaign-info.outputs.campaign-label }}
+          CAMPAIGN_NAME: ${{ steps.campaign-info.outputs.campaign-name }}
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+          MERGED_COUNT: ${{ steps.check-status.outputs.merged-count }}
+        with:
+          script: |
+            const targetBranch = process.env.TARGET_BRANCH;
+            const campaignBranchName = process.env.CAMPAIGN_BRANCH;
+            const campaignLabel = process.env.CAMPAIGN_LABEL;
+            const campaignName = process.env.CAMPAIGN_NAME;
+            const mergedCount = parseInt(process.env.MERGED_COUNT);
+
+            console.log(`Creating consolidation PR: ${campaignBranchName} -> ${targetBranch}`);
+
+            // Check if consolidation PR already exists
+            const existingPRs = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              head: `${context.repo.owner}:${campaignBranchName}`,
+              base: targetBranch
+            });
+
+            if (existingPRs.data.length > 0) {
+              console.log(`Consolidation PR already exists: #${existingPRs.data[0].number}`);
+              return;
+            }
+
+            // Verify campaign branch exists
+            try {
+              await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: campaignBranchName
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(`Campaign branch ${campaignBranchName} does not exist. Nothing to consolidate.`);
+                return;
+              }
+              throw error;
+            }
+
+            // Compare campaign branch to target
+            const comparison = await github.rest.repos.compareCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              base: targetBranch,
+              head: campaignBranchName
+            });
+            console.log(`Campaign branch vs ${targetBranch}: ahead by ${comparison.data.ahead_by}, behind by ${comparison.data.behind_by}`);
+
+            if (comparison.data.ahead_by === 0) {
+              console.log('Campaign branch has no commits ahead of target. Nothing to consolidate.');
+              return;
+            }
+
+            // Build the merged fixes summary for the PR body
+            const openIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: `codeql,${campaignLabel}`
+            });
+
+            const mergedFixesSummary = openIssues.data
+              .filter(issue =>
+                !issue.title.startsWith('[Security campaign tracking]') &&
+                issue.labels.some(l => typeof l === 'string' ? l === 'merged' : l.name === 'merged')
+              )
+              .map(issue => {
+                const branchMatch = issue.body ? issue.body.match(/`(fix-codeql-alert-\d+)`/) : null;
+                const branchName = branchMatch ? branchMatch[1] : 'unknown';
+                return `- \`${branchName}\` (issue #${issue.number}: ${issue.title})`;
+              })
+              .join('\n');
+
+            // Create consolidation PR
+            try {
+              const pr = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[CodeQL] Consolidate ${campaignName} security fixes`,
+                head: campaignBranchName,
+                base: targetBranch,
+                body: [
+                  `## CodeQL Fix Consolidation - ${campaignName}`,
+                  '',
+                  `This PR consolidates all CodeQL fixes from campaign \`${campaignName}\` into the \`${targetBranch}\` branch.`,
+                  '',
+                  '### Merged Fix Branches',
+                  mergedFixesSummary,
+                  '',
+                  '### Details',
+                  `- Campaign: ${campaignName}`,
+                  `- Total fixes merged: ${mergedCount}`,
+                  `- Commits ahead: ${comparison.data.ahead_by}`,
+                  '- This PR was automatically created by the consolidation workflow',
+                  '',
+                  'Please review and merge to apply all security fixes to the target branch.'
+                ].join('\n')
+              });
+
+              console.log(`\nCreated consolidation PR #${pr.data.number}: ${pr.data.html_url}`);
+            } catch (error) {
+              if (error.status === 422) {
+                console.log('Could not create PR - campaign branch may already be up to date with target');
+              } else {
+                throw error;
+              }
+            }
+
+

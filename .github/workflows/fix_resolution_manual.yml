@@ -1,0 +1,254 @@
+# .github/workflows/03-fix-resolution-manual.yml
+name: Fix Resolution - Manual Verification
+
+on:
+  push:
+    branches:
+      - 'fix-codeql-alert-[0-9]+'
+
+env:
+  TARGET_BRANCH: 'codeql-advanced-configuration'
+
+permissions:
+  contents: write
+  security-events: write
+  issues: write
+  pull-requests: write
+  actions: read
+  packages: read
+
+jobs:
+  init:
+    name: Initialize Workflow
+    runs-on: ubuntu-latest
+    outputs:
+      target-branch: ${{ env.TARGET_BRANCH }}
+    steps:
+      - run: echo "Target branch is ${{ env.TARGET_BRANCH }}"
+
+  get-alert-info:
+    name: Get Alert Info
+    needs: init
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
+    outputs:
+      branch-name: ${{ steps.get-info.outputs.branch-name }}
+      alert-id: ${{ steps.get-info.outputs.alert-id }}
+      query-id: ${{ steps.extract-info.outputs.query-id }}
+      package-path: ${{ steps.extract-info.outputs.package-path }}
+      campaign-name: ${{ steps.campaign.outputs.campaign-name }}
+      campaign-label: ${{ steps.campaign.outputs.campaign-label }}
+      campaign-branch: ${{ steps.campaign.outputs.branch-name }}
+    steps:
+      - name: Get Information about the Alert
+        id: get-info
+        run: |
+          echo "alert-id=${GITHUB_REF_NAME#fix-codeql-alert-}" >> $GITHUB_OUTPUT
+          echo "branch-name=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+  
+      - name: Extract alert ID and get query ID
+        id: extract-info
+        uses: addventa/.github/.github/actions/alerts/extract_alert_info@v3
+        with:
+          branch-name: ${{ github.ref_name }}
+          alert-id: ${{ steps.get-info.outputs.alert-id }}
+
+      - name: Get Campaign Info
+        id: campaign
+        uses: addventa/.github/.github/actions/campaign/get_campaign_info@v3
+  verify-fix:
+    name: Verify Vulnerability Resolution by Manual Fix
+    needs:
+      - get-alert-info
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+      actions: read
+    outputs:
+      exists: ${{ steps.check-resolved.outputs.exists }}
+      state: ${{ steps.check-resolved.outputs.state }}
+      resolved: ${{ steps.check-resolved.outputs.resolved }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.get-alert-info.outputs.branch-name }}
+
+      - name: CodeQL Branch Scan
+        uses: addventa/.github/.github/actions/codeql/codeql_branch_scan@v3
+        with:
+          branch: ${{ needs.get-alert-info.outputs.branch-name }}
+          severity: 'high,critical'
+          query-id-restriction: ${{ needs.get-alert-info.outputs.query-id }}
+          package-path-restriction: ${{ needs.get-alert-info.outputs.package-path }}
+  
+      - name: Check if vulnerability is resolved
+        id: check-resolved
+        uses: addventa/.github/.github/actions/alerts/check_codeql_alert@v3
+        with:
+          branch: ${{ needs.get-alert-info.outputs.branch-name }}
+          alert-id: ${{ needs.get-alert-info.outputs.alert-id }}
+          fail-on-missing: true
+      
+      - name: Log job outputs
+        run: |
+          echo "=== Check CodeQL Alert Action Outputs ==="
+          echo "exists=${{ steps.check-resolved.outputs.exists }}" >> $GITHUB_OUTPUT
+          echo "state=${{ steps.check-resolved.outputs.state }}" >> $GITHUB_OUTPUT
+          echo "resolved=${{ steps.check-resolved.outputs.resolved }}" >> $GITHUB_OUTPUT
+
+      - name: Alert if still vulnerable
+        if: steps.check-resolved.outputs.resolved == 'false'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const branchName = '${{ needs.get-alert-info.outputs.branch-name }}';
+            
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'codeql'
+            });
+
+            for (const issue of issues.data) {
+              if (issue.body && issue.body.includes(`\`${branchName}\``)) {
+                const issueBody = [
+                  '⚠️ Changes pushed but vulnerability still present. Please review the fix.',
+                  '',
+                  `Commit: ${context.sha}`
+                ];
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: issueBody.join('\n')
+                });
+                break;
+              }
+            }
+            
+            core.setFailed('Vulnerability still present after manual fix');
+  
+      - name: Build and Test
+        uses: ./.github/actions/build_and_test
+        with:
+          branch-name: ${{ needs.get-alert-info.outputs.branch-name }}
+
+  monitor-outputs:
+    name: Monitor Verify-Fix Outputs
+    needs: [verify-fix, get-alert-info]
+    runs-on: ubuntu-latest
+    steps:    
+      - name: Debug - Log get-alert-info outputs
+        env:
+          ALERT_EXISTS: ${{needs.verify-fix.outputs.exists}}
+          ALERT_RESOLVED: ${{needs.verify-fix.outputs.resolved}}
+        run: |
+          echo "=== get-alert-info Job Outputs ==="
+          echo "branch-name: ${{ needs.get-alert-info.outputs.branch-name }}"
+          echo "query-id: ${{ needs.get-alert-info.outputs.query-id }}"
+          echo "alert-id: ${{ needs.get-alert-info.outputs.alert-id }}"
+          echo "package-path: ${{ needs.get-alert-info.outputs.package-path }}"
+          echo ""
+
+          echo "=== Verify-Fix Job Outputs ==="
+          echo "resolved: ${{ needs.verify-fix.outputs.resolved }}"
+          echo "exists: ${{ needs.verify-fix.outputs.exists }}"
+          echo "state: ${{ needs.verify-fix.outputs.state }}"
+
+          echo "ALERT_EXISTS: ${{ env.ALERT_EXISTS }}"
+          echo "ALERT_RESOLVED: ${{ env.ALERT_RESOLVED }}"
+
+  handle-fix-issue:
+    name: Handle Fix Issue
+    needs:
+      - get-alert-info
+      - verify-fix
+    if: needs.verify-fix.outputs.resolved == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set related issue to Pending
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const branchName = '${{ needs.get-alert-info.outputs.branch-name }}';
+            
+            // Rechercher l'issue liée
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['codeql', `alert:${{ needs.get-alert-info.outputs.alert-id }}`]
+            });
+            console.log(`Found ${issues.data.length} issues`);
+
+            for (const issue of issues.data) {
+              if (issue.body && issue.body.includes(`\`${branchName}\``)) {
+              
+                const issueBody = [
+                  '✅ Manual fix verified successfully. Vulnerability resolved. Fix is pending release.',
+                  '',
+                  `Commit: ${context.sha}`
+                ].join('\n');
+                
+                const newLabels = [...issue.labels.map(l => l.name), 'pending'];
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: issueBody
+                });
+            
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  labels: newLabels
+                });
+
+                console.log(`Updated issue #${issue.number} to pending status`);
+                break;
+              }
+            }
+
+  merge-fix-to-campaign:
+    name: Merge Fix Branch to Campaign
+    needs:
+      - init
+      - get-alert-info
+      - verify-fix
+      # run after:
+      - handle-fix-issue
+    if: needs.verify-fix.outputs.resolved == 'true'
+    uses: ./.github/workflows/merge_fix_to_campaign.yml
+    with:
+      target-branch: ${{ needs.init.outputs.target-branch }}
+      fix-branch-name: ${{ needs.get-alert-info.outputs.branch-name }}
+    secrets: inherit
+
+  consolidate-campaign:
+    name: Consolidate Campaign Fixes
+    needs:
+      - init
+      - verify-fix
+      # run after:
+      - merge-fix-to-campaign
+    if: needs.verify-fix.outputs.resolved == 'true'
+    uses: ./.github/workflows/consolidate_campaign.yml
+    with:
+      target-branch: ${{ needs.init.outputs.target-branch }}
+    secrets: inherit
+

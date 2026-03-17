@@ -1,0 +1,52 @@
+name: publish to github packages (npm)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip publish and only build"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: build and publish packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 16.x
+          cache: yarn
+          registry-url: "https://npm.pkg.github.com"
+
+      - name: install deps
+        run: |
+          npm install -g lerna
+          yarn install --frozen-lockfile
+
+      - name: build
+        run: |
+          lerna run build
+
+      - name: publish (github packages)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm config set registry https://npm.pkg.github.com
+          npm whoami || true
+          lerna publish from-package --yes --no-push

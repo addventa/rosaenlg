@@ -1,0 +1,70 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches:
+      - release/docker
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+        matrix:
+            services:
+                # list your service here
+                - external
+                - internal
+    steps:
+      - uses: actions/checkout@v3
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v2
+        with:
+          submodules: recursive
+          token: ${{ secrets.SCRIBEAM_GIT_TOKEN }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set version
+        run: |
+          VERSION=$(node -pe "require('./package.json').version")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo $VERSION
+        
+      - name: Create and Set current tag
+        if: matrix.services == 'external'
+        run: |
+          git config user.name "infraaddventa"
+          git config user.email "infra@addventa.com"
+          git tag -a "v${{ env.VERSION }}" -m "release v${{ env.VERSION }}"
+          git push origin v${{ env.VERSION }}
+        
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v5
+        if: matrix.services == 'external'
+        with:
+          build-args: SCRIBEAM_GIT_TOKEN=${{ secrets.SCRIBEAM_GIT_TOKEN }}
+          context: .
+          file: Dockerfile
+          tags: addventa/scribeam-bnppam-rosaenlg-commentairesallocation-main:${{ env.VERSION }}
+          push: true
+
+      - name: Set env
+        if: matrix.services == 'internal'
+        run: |
+          mv -f ./.ecs.env ./.env
+          cat ./.env
+
+      - name: Build and push Docker images for ECS
+        uses: docker/build-push-action@v5
+        if: matrix.services == 'internal'
+        with:
+          build-args: SCRIBEAM_GIT_TOKEN=${{ secrets.SCRIBEAM_GIT_TOKEN }}
+          context: .
+          file: Dockerfile
+          tags: addventa/addventa-bnppam-commentairesallocation-rosaenlg-main:${{ env.VERSION }}
+          push: true
+          no-cache: true

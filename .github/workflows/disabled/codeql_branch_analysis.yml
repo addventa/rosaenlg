@@ -1,0 +1,199 @@
+
+name: "CodeQL Branch Analysis (reusable)"
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        required: true
+        type: string
+        description: 'Branch name to scan'
+      severity:
+        required: false
+        type: string
+        description: 'Severity filter - affects which query packs are used (high/critical = security-extended, all = security-and-quality)'
+        default: 'high,critical'
+      query-id:
+        required: false
+        type: string
+        description: 'Specific CodeQL query/rule ID to scan (e.g., javascript/example/rule-name). If provided, only this query will be run.'
+    outputs:
+      results-file:
+        description: 'Path to the SARIF results file'
+        value: ${{ jobs.analyze.outputs.results-file }}
+      results-json:
+        description: 'Path to the JSON results file'
+        value: ${{ jobs.analyze.outputs.results-json }}
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: read
+    outputs:
+      results-file: ${{ steps.set-outputs.outputs.results-file }}
+      results-json: ${{ steps.set-outputs.outputs.results-json }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.branch }}
+
+    - name: Install CodeQL CLI
+      uses: github/codeql-action/setup-codeql@v4
+
+    - name: Add CodeQL to PATH
+      run: |
+        # Find CodeQL installation directory and add to PATH
+        CODEQL_DIR=$(find "$RUNNER_TOOL_CACHE" -type d -name "codeql" -path "*/CodeQL/*" 2>/dev/null | head -1)
+        if [ -z "$CODEQL_DIR" ]; then
+          CODEQL_DIR=$(find /opt/hostedtoolcache -type d -name "codeql" -path "*/CodeQL/*" 2>/dev/null | head -1)
+        fi
+        if [ -n "$CODEQL_DIR" ] && [ -d "$CODEQL_DIR" ]; then
+          echo "$CODEQL_DIR" >> $GITHUB_PATH
+          echo "Added CodeQL to PATH: $CODEQL_DIR"
+          echo "CODEQL_DIR=$CODEQL_DIR" >> $GITHUB_ENV
+        else
+          echo "Warning: Could not find CodeQL directory, will try to find binary directly"
+        fi
+        
+        echo "Query ID input value: '${{ inputs.query-id }}'"
+        if [ -z "${{ inputs.query-id }}" ]; then
+          echo "Query ID is empty or not set"
+        else
+          echo "Query ID is set: ${{ inputs.query-id }}"
+        fi
+
+    - name: Create CodeQL Database
+      run: |
+        QUERY_ID="${{ inputs.query-id }}"
+
+        codeql database create codeql-database \
+          --language=javascript \
+          --source-root=. \
+          ${QUERY_ID:+--query-filter="id:$QUERY_ID"} \
+          --threads=0
+
+    - name: Run CodeQL Analysis
+      run: |
+        QUERY_ID="${{ inputs.query-id }}" 
+
+        codeql database analyze codeql-database \
+          ${QUERY_ID:+--query-filter="id:$QUERY_ID"} \
+          --threads=0 \
+          --format=sarif-latest \
+          --output=codeql-results.sarif
+
+    - name: Convert SARIF to JSON
+      uses: actions/github-script@v8
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Read SARIF file
+          const sarifPath = path.join(process.cwd(), 'codeql-results.sarif');
+          let sarifData;
+          
+          try {
+            sarifData = JSON.parse(fs.readFileSync(sarifPath, 'utf8'));
+          } catch (error) {
+            console.error('Failed to read SARIF file:', error);
+            throw new Error(`Could not read SARIF file: ${error.message}`);
+          }
+          
+          // Count total alerts in SARIF
+          let totalAlerts = 0;
+          if (sarifData.runs && sarifData.runs.length > 0) {
+            for (const run of sarifData.runs) {
+              if (run.results && run.results.length > 0) {
+                totalAlerts += run.results.length;
+              }
+            }
+          }
+          console.log(`Found ${totalAlerts} total alerts in CodeQL analysis results`);
+          
+          // Parse severity filter
+          const severityInput = '${{ inputs.severity }}';
+          const severityLevels = severityInput.split(',').map(s => s.trim().toLowerCase());
+          console.log(`Filtering results by severity: ${severityLevels.join(', ')}`);
+          
+          // Extract results in a more usable format
+          const results = [];
+          
+          if (sarifData.runs && sarifData.runs.length > 0) {
+            for (const run of sarifData.runs) {
+              if (run.results && run.results.length > 0) {
+                for (const result of run.results) {
+                  const rule = run.tool?.driver?.rules?.find(r => r.id === result.ruleId);
+                  
+                  // Get security severity from rule properties
+                  const securitySeverity = (
+                    rule?.properties?.['security-severity'] ||
+                    rule?.properties?.securitySeverity ||
+                    rule?.properties?.['security_severity'] ||
+                    ''
+                  ).toLowerCase();
+                  
+                  // Filter by severity if severity filter is provided
+                  if (severityLevels.length > 0 && severityLevels[0] !== '' && !severityLevels.includes(securitySeverity)) {
+                    continue; // Skip this result if it doesn't match the severity filter
+                  }
+                  
+                  results.push({
+                    ruleId: result.ruleId,
+                    ruleName: rule?.name || result.ruleId,
+                    severity: result.level || rule?.defaultConfiguration?.level || 'warning',
+                    securitySeverity: securitySeverity || 'unknown',
+                    message: result.message?.text || result.message?.markdown || '',
+                    locations: result.locations?.map(loc => ({
+                      file: loc.physicalLocation?.artifactLocation?.uri || '',
+                      line: loc.physicalLocation?.region?.startLine || 0,
+                      column: loc.physicalLocation?.region?.startColumn || 0
+                    })) || []
+                  });
+                }
+              }
+            }
+          }
+          
+          console.log(`After severity filtering: ${results.length} alerts match the severity criteria`);
+          
+          // Write JSON results
+          const jsonPath = path.join(process.cwd(), 'codeql-results.json');
+          fs.writeFileSync(jsonPath, JSON.stringify({
+            summary: {
+              totalResults: results.length,
+              timestamp: new Date().toISOString(),
+              branch: '${{ inputs.branch }}',
+              severity: '${{ inputs.severity }}',
+              queryId: '${{ inputs.query-id }}'
+            },
+            results: results
+          }, null, 2), 'utf8');
+          
+          console.log(`Converted ${results.length} results to JSON format`);
+          console.log(`Results saved to: ${jsonPath}`);
+
+    - name: Upload Results as Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-analysis-results
+        path: |
+          codeql-results.sarif
+          codeql-results.json
+        retention-days: 7
+
+    - name: Set Outputs
+      id: set-outputs
+      run: |
+        echo "results-file=codeql-results.sarif" >> $GITHUB_OUTPUT
+        echo "results-json=codeql-results.json" >> $GITHUB_OUTPUT
+        echo "Results files uploaded as artifacts:"
+        echo "  SARIF: codeql-results.sarif"
+        echo "  JSON: codeql-results.json"
+        echo "Download using: actions/download-artifact@v4 with name: codeql-analysis-results"

@@ -1,0 +1,293 @@
+name: 📢 Campaign Release Communication
+
+# Triggered manually after all revisions from a security campaign have been
+# promoted.  The workflow:
+#   1. Collects campaign data from GitHub (versions, fixed issues, open vulns)
+#   2. Archives the current versioning document on Google Drive and appends
+#      the campaign results to the new copy
+#   3. Sends a release notification email to clients with the document attached
+#
+# Required secrets:
+#   GOOGLE_SERVICE_ACCOUNT_KEY  – service-account JSON with Drive access
+#   SMTP_HOST                   – SMTP server
+#   SMTP_PORT                   – SMTP port (optional, default 587)
+#   SMTP_USER                   – SMTP username / sender
+#   SMTP_PASSWORD               – SMTP password
+#   SMTP_FROM                   – override sender address (optional)
+
+on:
+  workflow_dispatch:
+    inputs:
+      campaign-label:
+        description: |
+          Campaign label to collect data for (e.g. "campaign:2026-Q1").
+          Leave empty to use the current quarter automatically.
+        required: false
+        type: string
+
+      target-date:
+        description: 'Planned delivery date for clients (YYYY-MM-DD). Defaults to today.'
+        required: false
+        type: string
+
+      recipients:
+        description: |
+          Comma-separated email addresses of the clients to notify.
+          Leave empty to fall back to the CAMPAIGN_RECIPIENTS repository secret.
+        required: false
+        type: string
+
+      dry-run:
+        description: 'Dry run — collect data, log everything, but do not update Drive or send email'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — collect all relevant data from GitHub issues / tags
+  # ────────────────────────────────────────────────────────────────────────────
+  collect-campaign-data:
+    name: Collect Campaign Data
+    runs-on: ubuntu-latest
+
+    outputs:
+      campaign-name:             ${{ steps.campaign-info.outputs.campaign-name }}
+      campaign-label:            ${{ steps.campaign-info.outputs.campaign-label }}
+      new-versions:              ${{ steps.collect.outputs.new-versions }}
+      fixed-issues:              ${{ steps.collect.outputs.fixed-issues }}
+      remaining-vulnerabilities: ${{ steps.collect.outputs.remaining-vulnerabilities }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Compute campaign name/label from current quarter (may be overridden below)
+      - name: Get Campaign Info
+        id: campaign-info-default
+        uses: addventa/.github/.github/actions/campaign/get_campaign_info@v3
+      # If the caller supplied an explicit campaign-label, extract the name from it
+      # (e.g. "campaign:2026-Q1" → "2026-Q1"); otherwise keep the computed one.
+      - name: Resolve campaign name and label
+        id: campaign-info
+        run: |
+          INPUT_LABEL="${{ inputs.campaign-label }}"
+          if [ -n "$INPUT_LABEL" ]; then
+            # strip the "campaign:" prefix to get the name
+            CAMPAIGN_NAME="${INPUT_LABEL#campaign:}"
+            CAMPAIGN_LABEL="$INPUT_LABEL"
+          else
+            CAMPAIGN_NAME="${{ steps.campaign-info-default.outputs.campaign-name }}"
+            CAMPAIGN_LABEL="${{ steps.campaign-info-default.outputs.campaign-label }}"
+          fi
+          echo "campaign-name=${CAMPAIGN_NAME}"  >> "$GITHUB_OUTPUT"
+          echo "campaign-label=${CAMPAIGN_LABEL}" >> "$GITHUB_OUTPUT"
+          echo "Using campaign: ${CAMPAIGN_NAME} (label: ${CAMPAIGN_LABEL})"
+
+      - name: Collect versions, fixed issues and remaining vulnerabilities
+        id: collect
+        uses: actions/github-script@v7
+        env:
+          CAMPAIGN_LABEL: ${{ steps.campaign-info.outputs.campaign-label }}
+        with:
+          script: |
+            const campaignLabel = process.env.CAMPAIGN_LABEL;
+            core.info(`Collecting data for: ${campaignLabel}`);
+
+            // ── Fetch all open issues tagged with this campaign ──────────────
+            const campaignIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              labels: campaignLabel,
+              per_page: 100,
+            });
+
+            // Helper: extract all label names from an issue
+            const labelNames = issue =>
+              issue.labels.map(l => (typeof l === 'string' ? l : l.name) || '');
+
+            // ── 1. New versions released — derive from in-rev:* labels ───────
+            const inRevVersions = new Set();
+            for (const issue of campaignIssues) {
+              for (const name of labelNames(issue)) {
+                if (name.startsWith('in-rev:v')) inRevVersions.add(name.replace('in-rev:', ''));
+              }
+            }
+            core.info(`Versions with in-rev label: ${[...inRevVersions].join(', ') || '(none)'}`);
+
+            const newVersions = [];
+            for (const version of inRevVersions) {
+              let tagDate = '';
+              try {
+                const ref = await github.rest.git.getRef({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  ref: `tags/${version}`,
+                });
+                // Annotated tag → tagger date; lightweight tag → commit date
+                try {
+                  const tag = await github.rest.git.getTag({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    tag_sha: ref.data.object.sha,
+                  });
+                  tagDate = (tag.data.tagger?.date || '').split('T')[0];
+                } catch {
+                  const commit = await github.rest.git.getCommit({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    commit_sha: ref.data.object.sha,
+                  });
+                  tagDate = (commit.data.committer?.date || '').split('T')[0];
+                }
+              } catch (e) {
+                core.warning(`Tag ${version} not found: ${e.message}`);
+              }
+
+              // List the issues fixed in this specific revision
+              const changesForVersion = campaignIssues
+                .filter(issue =>
+                  !issue.title.startsWith('[Security campaign tracking]') &&
+                  labelNames(issue).includes(`in-rev:${version}`)
+                )
+                .map(issue => ({ number: issue.number, title: issue.title }));
+
+              newVersions.push({ version, date: tagDate, changes: changesForVersion });
+            }
+            newVersions.sort((a, b) => a.version.localeCompare(b.version, undefined, { numeric: true }));
+
+            // ── 2. Fixed issues (in this campaign, already released) ─────────
+            const fixedIssues = campaignIssues
+              .filter(issue =>
+                !issue.title.startsWith('[Security campaign tracking]') &&
+                labelNames(issue).some(n => n.startsWith('in-rev:'))
+              )
+              .map(issue => {
+                const names = labelNames(issue);
+                // Severity: CodeQL uses error/warning/note or critical/high/medium/low
+                const severityLabel = names.find(n =>
+                  ['critical','high','medium','low','error','warning','note'].includes(n.toLowerCase())
+                );
+                // Which revision fixed it
+                const fixedInLabel = names.find(n => n.startsWith('in-rev:'));
+                return {
+                  number:  issue.number,
+                  title:   issue.title,
+                  severity: severityLabel || 'unknown',
+                  fixedIn:  fixedInLabel ? fixedInLabel.replace('in-rev:', '') : '',
+                  url:      issue.html_url,
+                };
+              });
+
+            // ── 3. Remaining open CodeQL issues (not addressed in campaign) ──
+            const allCodeqlIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              labels: 'codeql',
+              per_page: 100,
+            });
+
+            const remainingVulns = allCodeqlIssues
+              .filter(issue =>
+                !issue.title.startsWith('[Security campaign tracking]') &&
+                !labelNames(issue).some(n =>
+                  n.startsWith('in-rev:') ||
+                  n.startsWith('pending-rev:') ||
+                  n === 'merged'
+                )
+              )
+              .map(issue => {
+                const names = labelNames(issue);
+                const severityLabel = names.find(n =>
+                  ['critical','high','medium','low','error','warning','note'].includes(n.toLowerCase())
+                );
+                return {
+                  number:   issue.number,
+                  title:    issue.title,
+                  severity: severityLabel || 'unknown',
+                  url:      issue.html_url,
+                };
+              });
+
+            core.info(`Results — versions: ${newVersions.length}, fixed: ${fixedIssues.length}, remaining: ${remainingVulns.length}`);
+
+            core.setOutput('new-versions',              JSON.stringify(newVersions));
+            core.setOutput('fixed-issues',              JSON.stringify(fixedIssues));
+            core.setOutput('remaining-vulnerabilities', JSON.stringify(remainingVulns));
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — archive current document and append campaign results
+  # ────────────────────────────────────────────────────────────────────────────
+  update-document:
+    name: Update Versioning Document on Google Drive
+    runs-on: ubuntu-latest
+    needs: collect-campaign-data
+
+    outputs:
+      document-id:   ${{ steps.update.outputs.file-id }}
+      document-url:  ${{ steps.update.outputs.file-url }}
+      document-name: ${{ steps.update.outputs.file-name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Archive & update versioning document
+        id: update
+        uses: addventa/.github/.github/actions/communication/update_versioning_doc@v3
+        with:
+          google-credentials:       ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+          campaign-name:            ${{ needs.collect-campaign-data.outputs.campaign-name }}
+          target-date:              ${{ inputs.target-date }}
+          new-versions:             ${{ needs.collect-campaign-data.outputs.new-versions }}
+          fixed-issues:             ${{ needs.collect-campaign-data.outputs.fixed-issues }}
+          remaining-vulnerabilities: ${{ needs.collect-campaign-data.outputs.remaining-vulnerabilities }}
+          dry-run:                  ${{ inputs.dry-run }}
+
+      - name: Print document URL
+        run: |
+          echo "📄 Updated document: ${{ steps.update.outputs.file-url }}"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — send email to clients
+  # ────────────────────────────────────────────────────────────────────────────
+  notify-clients:
+    name: Send Client Notification Email
+    runs-on: ubuntu-latest
+    needs: [collect-campaign-data, update-document]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Send notification email
+        uses: addventa/.github/.github/actions/communication/notify_clients@v3
+        with:
+          smtp-host:     ${{ secrets.SMTP_HOST }}
+          smtp-port:     ${{ secrets.SMTP_PORT || '587' }}
+          smtp-user:     ${{ secrets.SMTP_USER }}
+          smtp-password: ${{ secrets.SMTP_PASSWORD }}
+          from:          ${{ secrets.SMTP_FROM }}
+          # recipients input takes priority; fall back to the CAMPAIGN_RECIPIENTS
+          # secret so automatic dispatches (from cascade_patch_release) work without
+          # requiring a human to pass the address list each time.
+          to:            ${{ inputs.recipients || secrets.CAMPAIGN_RECIPIENTS }}
+
+          repo-name:     'BNPPAM CommentairesAllocation'
+          campaign-name: ${{ needs.collect-campaign-data.outputs.campaign-name }}
+          target-date:   ${{ inputs.target-date }}
+
+          new-versions:              ${{ needs.collect-campaign-data.outputs.new-versions }}
+          fixed-issues:              ${{ needs.collect-campaign-data.outputs.fixed-issues }}
+          remaining-vulnerabilities: ${{ needs.collect-campaign-data.outputs.remaining-vulnerabilities }}
+
+          document-id:        ${{ needs.update-document.outputs.document-id }}
+          document-name:      ${{ needs.update-document.outputs.document-name }}
+          google-credentials: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+
+          dry-run: ${{ inputs.dry-run }}
+
+

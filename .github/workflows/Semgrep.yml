@@ -1,0 +1,39 @@
+name: Analyse CodeQL
+on:
+  schedule:
+    - cron: '0 0 1 1,4,7,10 *'  # tous les 3 mois
+  workflow_dispatch:
+
+jobs:
+  codeql-analysis:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write  # obligatoire pour publier le SARIF
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript]
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Initialiser CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Analyse CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: results  # Dossier de sortie
+          output_format: sarif
+
+      - name: Sauvegarder le SARIF comme artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sast-report
+          path: results/${{ matrix.language }}.sarif

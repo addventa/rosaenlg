@@ -1,0 +1,72 @@
+name: 🚀 Promote RC to Final Patch Release
+
+# Promotes an RC tag to final release:
+#   - vX.Y.Z-rc.N → vX.Y.Z (patch RC to final patch)
+#   - vX.Y.Z-rev.R-rc.N → vX.Y.Z-rev.R (revision RC to final revision)
+#
+# Uses GitHub App token to push tags so downstream workflows (cascade) are triggered.
+# Docker images are retagged accordingly.
+#
+# After a revision RC promotion, if the revised patch is the latest in its minor
+# (no higher patch or RC exists), the release/X.Y branch is repositioned to the
+# revision commit. This push uses GITHUB_TOKEN so it does NOT trigger CI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "RC Tag to promote (ex: v6.4.25-rc.1). Leave empty for latest."
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      rc_tag:
+        description: "RC Tag to promote (ex: v6.4.25-rc.1). Leave empty for latest."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  promote:
+    uses: addventa/.github/.github/workflows/promote-prod.yml@v3
+    with:
+      image_name: "addventa/addventa-bnppam-commentairesallocation-rosaenlg-main"
+      rc_tag: ${{ inputs.rc_tag }}
+      lang: "node"
+      use_app_token: true
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
+
+  # Issue label tracking (planned-rev / pending-rev → in-rev) is now handled
+  # by the mark-revision-complete job in cascade_patch_release.yml, which runs
+  # AFTER cascade targets have been registered as planned-rev. This prevents
+  # the race condition where in-rev was set before downstream targets had their
+  # planned-rev labels written.
+
+  # After promoting a revision RC to its final tag, reposition release/X.Y
+  # to the revision commit — but only if no higher patch exists in that minor.
+  # Uses GITHUB_TOKEN (default checkout, no App token) so the push does NOT
+  # trigger the release workflow.
+  align-minor-branch:
+    name: Align Minor Release Branch
+    needs: [promote]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          # No token → GITHUB_TOKEN; push won't trigger the release workflow
+
+      - name: Align release/X.Y if promoted revision is latest in minor
+        uses: addventa/.github/.github/actions/release/align_minor_branch@v3
+        with:
+          rc-tag: ${{ inputs.rc_tag }}
+

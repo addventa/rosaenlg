@@ -1,0 +1,547 @@
+# .github/workflows/cascade_patch_release.yml
+#
+# Cascade Patch Release
+#
+# Triggered by a tag push (vX.Y.Z or vX.Y.Z-rev.R).
+# Propagates fixes forward through version history by merging into release branches:
+#
+#   Revision trigger (vX.Y.Z-rev.R):
+#     → Merge revision into release/X.Y branch
+#     → Release workflow produces next version, which re-triggers cascade
+#
+#   Patch trigger (vX.Y.Z):
+#     → Find higher minor/major versions that include ref
+#     → Merge into each release/X.Y branch (leaf targets only)
+#     → Release workflow produces next version, which re-triggers cascade
+#
+#   RC trigger (vX.Y.Z-rc.N):
+#     → No cascade (pre-release, waits until promoted or revised)
+#
+# NOTE: For the cascade to re-trigger automatically, the tag push must use a
+# token with workflow trigger permissions. This workflow uses a GitHub App
+# token (CI_APP_ID + CI_APP_PRIVATE_KEY secrets) since GITHUB_TOKEN does not
+# trigger subsequent workflow runs.
+
+name: Cascade Patch Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'                        # Final patch: vX.Y.Z
+      - 'v[0-9]+.[0-9]+.[0-9]+-rev.[0-9]+'             # Final revision: vX.Y.Z-rev.R
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+'              # Patch RC: vX.Y.Z-rc.N (no cascade, but parsed)
+   #   - 'v[0-9]+.[0-9]+.[0-9]+-rev.[0-9]+-rc.[0-9]+'  # Revision RC: vX.Y.Z-rev.R-rc.N (no cascade for RCs)
+
+permissions:
+  contents: write
+  issues: write
+  actions: write  # needed to dispatch campaign_communication.yml on completion
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # Step 1: Parse the triggering tag into version components
+  # ═══════════════════════════════════════════════════════════════════════
+  parse-trigger:
+    name: Parse Triggering Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.parse.outputs.tag }}
+      major: ${{ steps.parse.outputs.major }}
+      minor: ${{ steps.parse.outputs.minor }}
+      patch: ${{ steps.parse.outputs.patch }}
+      revision: ${{ steps.parse.outputs.revision }}
+      rc: ${{ steps.parse.outputs.rc }}
+
+      base-version: ${{ steps.parse.outputs.base-version }}
+      trigger-type: ${{ steps.parse.outputs.trigger-type }}
+      updated-version: ${{ steps.parse.outputs.updated-version }}
+    steps:
+      - name: Parse tag version components
+        id: parse
+        run: |
+          TAG="${{ github.ref_name }}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          VERSION="${TAG#v}"
+
+          # Parse version components - all patterns have MAJOR.MINOR.PATCH as first 3 groups
+          REVISION=""
+          RC=""
+          TRIGGER_TYPE=""
+          UPDATED_VERSION=""
+
+          if [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rev\.([0-9]+)-rc\.([0-9]+)$ ]]; then
+            # Format: X.Y.Z-rev.R-rc.N (revision RC - current format)
+            REVISION="${BASH_REMATCH[4]}"
+            RC="${BASH_REMATCH[5]}"
+            TRIGGER_TYPE="rc"  # RC tags don't cascade
+            UPDATED_VERSION="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          elif [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rev\.([0-9]+)$ ]]; then
+            # Format: X.Y.Z-rev.R (final revision)
+            REVISION="${BASH_REMATCH[4]}"
+            TRIGGER_TYPE="revision"
+            UPDATED_VERSION="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          elif [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)-rev\.([0-9]+)$ ]]; then
+            # Format: X.Y.Z-rc.N-rev.R (legacy format - revision of RC)
+            RC="${BASH_REMATCH[4]}"
+            REVISION="${BASH_REMATCH[5]}"
+            TRIGGER_TYPE="revision"  # Legacy revision triggers cascade
+            UPDATED_VERSION="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          elif [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([0-9]+)$ ]]; then
+            # Format: X.Y.Z-rc.N (patch RC)
+            RC="${BASH_REMATCH[4]}"
+            TRIGGER_TYPE="rc"
+            UPDATED_VERSION="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          elif [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            # Format: X.Y.Z (final patch)
+            PREV_PATCH=$((BASH_REMATCH[3] - 1))
+            if [ "$PREV_PATCH" -lt 0 ]; then
+              echo "::error::Cannot compute previous patch for patch 0"
+              exit 1
+            fi
+            TRIGGER_TYPE="patch"
+            UPDATED_VERSION="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${PREV_PATCH}"
+          else
+            echo "::error::Cannot parse tag ${TAG}"
+            exit 1
+          fi
+
+          # Extract common version components (valid after any successful match)
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+
+          # Output all values
+          echo "major=${MAJOR}" >> $GITHUB_OUTPUT
+          echo "minor=${MINOR}" >> $GITHUB_OUTPUT
+          echo "patch=${PATCH}" >> $GITHUB_OUTPUT
+          echo "revision=${REVISION}" >> $GITHUB_OUTPUT
+          echo "rc=${RC}" >> $GITHUB_OUTPUT
+          echo "base-version=${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
+          echo "trigger-type=${TRIGGER_TYPE}" >> $GITHUB_OUTPUT
+          echo "updated-version=${UPDATED_VERSION}" >> $GITHUB_OUTPUT
+          echo "Parsed ${TRIGGER_TYPE}: ${TAG} → ${MAJOR}.${MINOR}.${PATCH}${RC:+-rc.${RC}}${REVISION:+-rev.${REVISION}}, updated-version=${UPDATED_VERSION}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Get current version from tags
+        id: current-version
+        uses: addventa/.github/.github/actions/release/get_current_version@v3
+      - name: Compare tag with current version
+        env:
+          TAG_MAJOR: ${{ steps.parse.outputs.major }}
+          TAG_MINOR: ${{ steps.parse.outputs.minor }}
+          TAG_PATCH: ${{ steps.parse.outputs.patch }}
+          TAG_RC: ${{ steps.parse.outputs.rc }}
+          TAG_REVISION: ${{ steps.parse.outputs.revision }}
+          CURRENT_MAJOR: ${{ steps.current-version.outputs.major }}
+          CURRENT_MINOR: ${{ steps.current-version.outputs.minor }}
+          CURRENT_PATCH: ${{ steps.current-version.outputs.patch }}
+          CURRENT_RC: ${{ steps.current-version.outputs.rc }}
+          CURRENT_REVISION: ${{ steps.current-version.outputs.revision }}
+          CURRENT_BASE: ${{ steps.current-version.outputs.base-version }}
+        run: |
+          echo "=== Tag Parsed ==="
+          echo "  Major: ${TAG_MAJOR}, Minor: ${TAG_MINOR}, Patch: ${TAG_PATCH}"
+          echo "  RC: ${TAG_RC:-none}, Revision: ${TAG_REVISION:-none}"
+          
+          echo "=== Current Version (from get_current_version) ==="
+          echo "  Base: ${CURRENT_BASE}"
+          echo "  Major: ${CURRENT_MAJOR}, Minor: ${CURRENT_MINOR}, Patch: ${CURRENT_PATCH}"
+          echo "  RC: ${CURRENT_RC:-none}, Revision: ${CURRENT_REVISION:-none}"
+          
+          # Validate all components match
+          MISMATCH=""
+          
+          if [ "${TAG_MAJOR}" != "${CURRENT_MAJOR}" ]; then
+            MISMATCH="${MISMATCH}major (${TAG_MAJOR} vs ${CURRENT_MAJOR}), "
+          fi
+          if [ "${TAG_MINOR}" != "${CURRENT_MINOR}" ]; then
+            MISMATCH="${MISMATCH}minor (${TAG_MINOR} vs ${CURRENT_MINOR}), "
+          fi
+          if [ "${TAG_PATCH}" != "${CURRENT_PATCH}" ]; then
+            MISMATCH="${MISMATCH}patch (${TAG_PATCH} vs ${CURRENT_PATCH}), "
+          fi
+          if [ "${TAG_RC:-}" != "${CURRENT_RC:-}" ]; then
+            MISMATCH="${MISMATCH}rc (${TAG_RC:-none} vs ${CURRENT_RC:-none}), "
+          fi
+          if [ "${TAG_REVISION:-}" != "${CURRENT_REVISION:-}" ]; then
+            MISMATCH="${MISMATCH}revision (${TAG_REVISION:-none} vs ${CURRENT_REVISION:-none}), "
+          fi
+          
+          if [ -n "$MISMATCH" ]; then
+            echo "::error::Version mismatch between tag parsing and get_current_version: ${MISMATCH%%, }"
+            exit 1
+          fi
+          
+          echo "=== Comparison Passed ==="
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Step 2: Find cascade targets
+  #
+  # For revision triggers: target is the current minor (release/X.Y)
+  # For patch triggers: find higher minor/major versions that include
+  #   the ref version in their history. Only select "leaf" targets
+  #   (those that don't include another candidate) — the cascade handles
+  #   the rest when those targets get patched.
+  # For RC triggers: no cascade (skipped in parse-trigger)
+  # ═══════════════════════════════════════════════════════════════════════
+  find-cascade-targets:
+    name: Find Cascade Targets
+    needs: parse-trigger
+    if: needs.parse-trigger.outputs.trigger-type != 'rc'
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.find.outputs.targets }}
+      has-targets: ${{ steps.find.outputs.has-targets }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Find versions to cascade to
+        id: find
+        uses: addventa/.github/.github/actions/release/find_cascade_targets@v3
+        with:
+          trigger-type: ${{ needs.parse-trigger.outputs.trigger-type }}
+          ref-tag: ${{ needs.parse-trigger.outputs.tag }}
+          ref-major: ${{ needs.parse-trigger.outputs.major }}
+          ref-minor: ${{ needs.parse-trigger.outputs.minor }}
+          ref-patch: ${{ needs.parse-trigger.outputs.patch }}
+          updated-version: ${{ needs.parse-trigger.outputs.updated-version }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Step 2b: Mark cascade targets as planned BEFORE the merge runs
+  #
+  # For every revision cascade target identified above, adds a
+  # "planned-rev:vT-rev.N" label to campaign issues that currently carry
+  # the triggering version's "planned-rev:*" or "pending-rev:*" label.
+  # This must happen BEFORE the cascade matrix so the label is always
+  # present before the target's release workflow can auto-promote and call
+  # mark-completed for itself.
+  # ═══════════════════════════════════════════════════════════════════════
+  mark-planned-cascade:
+    name: Mark Cascade Targets as Planned
+    needs: [parse-trigger, find-cascade-targets]
+    if: |
+      needs.parse-trigger.outputs.trigger-type == 'revision' &&
+      needs.find-cascade-targets.outputs.has-targets == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Register cascade targets as planned-rev on campaign issues
+        uses: addventa/.github/.github/actions/release/trace_revision_issues@v3
+        with:
+          operation:    mark-planned
+          source-tag:   ${{ needs.parse-trigger.outputs.tag }}
+          targets-json: ${{ needs.find-cascade-targets.outputs.targets }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Step 3: Cascade to each target
+  #
+  # For each target version:
+  #   1. Checkout or create the release/X.Y branch
+  #   2. Merge the triggering tag (brings in fixes)
+  #   3. Push the branch — release workflow handles versioning and tagging
+  #   → The new tag re-triggers this workflow for further cascading
+  # ═══════════════════════════════════════════════════════════════════════
+  cascade:
+    name: Cascade to ${{ matrix.target.major }}.${{ matrix.target.minor }}
+    needs: [parse-trigger, find-cascade-targets, mark-planned-cascade]
+    # mark-planned-cascade is skipped for non-revision triggers; always() lets
+    # cascade still run when its dependency was skipped (not failed).
+    if: |
+      always() &&
+      needs.find-cascade-targets.outputs.has-targets == 'true' &&
+      needs.find-cascade-targets.result == 'success' &&
+      (needs.mark-planned-cascade.result == 'success' || needs.mark-planned-cascade.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        target: ${{ fromJson(needs.find-cascade-targets.outputs.targets) }}
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_APP_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Merge and push release branch
+        id: merge
+        env:
+          SOURCE_TAG: ${{ needs.parse-trigger.outputs.tag }}
+          TARGET_TAG: ${{ matrix.target.tag }}
+          TARGET_MAJOR: ${{ matrix.target.major }}
+          TARGET_MINOR: ${{ matrix.target.minor }}
+          TARGET_PATCH: ${{ matrix.target.patch }}
+          TRIGGER_TYPE: ${{ needs.parse-trigger.outputs.trigger-type }}
+          REF_PATCH: ${{ needs.parse-trigger.outputs.patch }}
+        run: |
+          VERSION_BRANCH="release/${TARGET_MAJOR}.${TARGET_MINOR}"
+
+          # When a revision cascades to a higher patch in the same minor, use a dedicated
+          # revision branch (release/X.Y.Z-rev) so the release workflow produces a revision
+          # of that patch rather than a new patch RC.
+          if [[ "${TRIGGER_TYPE}" == "revision" && "${TARGET_PATCH}" != "${REF_PATCH}" ]]; then
+            VERSION_BRANCH="release/${TARGET_MAJOR}.${TARGET_MINOR}.${TARGET_PATCH}-rev"
+            echo "Past-revision cascade: using revision branch ${VERSION_BRANCH}"
+          fi
+
+          echo "version-branch=${VERSION_BRANCH}" >> $GITHUB_OUTPUT
+          echo "Source: ${SOURCE_TAG}"
+          echo "Target branch: ${VERSION_BRANCH} (was at ${TARGET_TAG})"
+
+          git config user.name "addventa-github-actions[bot]"
+          git config user.email "addventa-github-actions[bot]@addventa.com"
+
+          # Check if version branch exists remotely
+          if git ls-remote --heads origin "${VERSION_BRANCH}" | grep -q "${VERSION_BRANCH}"; then
+            echo "Branch ${VERSION_BRANCH} exists, checking out..."
+            git checkout "${VERSION_BRANCH}"
+            git pull origin "${VERSION_BRANCH}"
+          else
+            echo "Branch ${VERSION_BRANCH} does not exist, creating from ${TARGET_TAG}..."
+            git checkout -b "${VERSION_BRANCH}" "${TARGET_TAG}"
+          fi
+
+          echo "✓ On branch ${VERSION_BRANCH} at $(git rev-parse --short HEAD)"
+
+          # Merge the source tag's changes
+          echo "Merging ${SOURCE_TAG} into ${VERSION_BRANCH}..."
+          if git merge "${SOURCE_TAG}" --no-ff -m "Merge ${SOURCE_TAG} into ${VERSION_BRANCH}
+
+          Cascade from ${SOURCE_TAG} to ${VERSION_BRANCH}"; then
+            echo "✓ Merge successful"
+          else
+            echo "Merge conflict, retrying with -X theirs..."
+            git merge --abort 2>/dev/null || true
+            if git merge "${SOURCE_TAG}" -X theirs --no-ff -m "Merge ${SOURCE_TAG} into ${VERSION_BRANCH} (auto-resolved)
+
+          Cascade from ${SOURCE_TAG} to ${VERSION_BRANCH}"; then
+              echo "✓ Auto-resolved merge successful"
+            else
+              echo "::error::Failed to merge ${SOURCE_TAG} into ${VERSION_BRANCH}"
+              exit 1
+            fi
+          fi
+
+      - name: Build and test
+        uses: ./.github/actions/build_and_test
+      - name: Push release branch
+        if: success()
+        env:
+          VERSION_BRANCH: ${{ steps.merge.outputs.version-branch }}
+          SOURCE_TAG: ${{ needs.parse-trigger.outputs.tag }}
+        run: |
+          git push origin "${VERSION_BRANCH}"
+          echo "✅ Pushed ${VERSION_BRANCH} — release workflow will handle versioning"
+
+      # For revision triggers: transition planned-rev:vTarget-rev.N → pending-rev:vTarget-rev.N
+      # now that the branch is pushed and the RC is building.
+      - name: Mark this cascade target as pending-rev
+        if: needs.parse-trigger.outputs.trigger-type == 'revision'
+        uses: addventa/.github/.github/actions/release/trace_revision_issues@v3
+        with:
+          operation:    mark-pending
+          target-major: ${{ matrix.target.major }}
+          target-minor: ${{ matrix.target.minor }}
+          target-patch: ${{ matrix.target.patch }}
+
+      - name: Report failure
+        if: failure()
+        uses: actions/github-script@v8
+        env:
+          SOURCE_TAG: ${{ needs.parse-trigger.outputs.tag }}
+          TARGET_MAJOR: ${{ matrix.target.major }}
+          TARGET_MINOR: ${{ matrix.target.minor }}
+        with:
+          script: |
+            const sourceTag = process.env.SOURCE_TAG;
+            const targetBranch = `release/${process.env.TARGET_MAJOR}.${process.env.TARGET_MINOR}`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⚠️ Cascade failed: ${sourceTag} → ${targetBranch}`,
+              body: [
+                `## Cascade Failed`,
+                '',
+                `Failed to cascade fixes from \`${sourceTag}\` to \`${targetBranch}\`.`,
+                '',
+                `**Source tag:** \`${sourceTag}\``,
+                `**Target branch:** \`${targetBranch}\``,
+                `**Workflow run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                '',
+                `Please manually merge the fixes into this branch.`
+              ].join('\n'),
+              labels: ['cascade-failure']
+            });
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Step 4 (revision only): Mark this revision as completed and detect
+  # campaign completion
+  #
+  # Runs after the cascade matrix (even if cascade was skipped because
+  # this is a leaf node with no targets). Transitions the triggering
+  # revision's label:  pending-rev:vX → in-rev:vX  (primary path)
+  #                    planned-rev:vX → in-rev:vX  (fallback if mark-pending skipped)
+  # The planned-rev labels for the next hop were already registered by
+  # mark-planned-cascade, so the invariant "downstream labels written
+  # before current label transitions to in-rev" is satisfied.
+  #
+  # If no planned-rev labels remain on any campaign issue afterwards,
+  # the whole campaign is complete and campaign_communication.yml is
+  # dispatched automatically.
+  # ═══════════════════════════════════════════════════════════════════════
+  mark-revision-complete:
+    name: Mark Revision Complete & Check Campaign
+    needs: [parse-trigger, find-cascade-targets, mark-planned-cascade, cascade]
+    # Run for any revision trigger, even if cascade was skipped (leaf node).
+    # Also run if mark-planned-cascade was skipped (no targets).
+    if: |
+      always() &&
+      needs.parse-trigger.outputs.trigger-type == 'revision' &&
+      needs.parse-trigger.result == 'success' &&
+      needs.find-cascade-targets.result == 'success' &&
+      (needs.cascade.result == 'success' || needs.cascade.result == 'skipped') &&
+      (needs.mark-planned-cascade.result == 'success' || needs.mark-planned-cascade.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      campaign-complete: ${{ steps.trace.outputs.campaign-complete }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Transition version to in-rev and check campaign completion
+        id: trace
+        uses: addventa/.github/.github/actions/release/trace_revision_issues@v3
+        with:
+          operation:   mark-completed
+          version-tag: ${{ needs.parse-trigger.outputs.tag }}
+
+      - name: Dispatch campaign communication workflow
+        if: steps.trace.outputs.campaign-complete == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('🎉 Campaign complete — dispatching campaign_communication.yml');
+            await github.rest.actions.createWorkflowDispatch({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              workflow_id: 'campaign_communication.yml',
+              ref:         'main',
+              // No inputs: the workflow auto-detects the current quarter's campaign.
+              // Operators can re-run with custom inputs (recipients, date) from the UI.
+            });
+            await core.summary
+              .addHeading('Campaign complete 🎉')
+              .addRaw('All planned revisions have been released. `campaign_communication.yml` has been dispatched.')
+              .write();
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # Summary
+  # ═══════════════════════════════════════════════════════════════════════
+  summary:
+    name: Cascade Summary
+    needs: [parse-trigger, find-cascade-targets, cascade, mark-revision-complete]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate summary
+        uses: actions/github-script@v8
+        env:
+          TRIGGER_TAG: ${{ needs.parse-trigger.outputs.tag }}
+          TRIGGER_TYPE: ${{ needs.parse-trigger.outputs.trigger-type }}
+          REF_MAJOR: ${{ needs.parse-trigger.outputs.major }}
+          REF_MINOR: ${{ needs.parse-trigger.outputs.minor }}
+          REF_PATCH: ${{ needs.parse-trigger.outputs.patch }}
+          REF_REVISION: ${{ needs.parse-trigger.outputs.revision }}
+          TARGETS_JSON: ${{ needs.find-cascade-targets.outputs.targets }}
+          HAS_TARGETS: ${{ needs.find-cascade-targets.outputs.has-targets }}
+          CASCADE_RESULT: ${{ needs.cascade.result }}
+        with:
+          script: |
+            const tag = process.env.TRIGGER_TAG;
+            const type = process.env.TRIGGER_TYPE;
+            const major = process.env.REF_MAJOR;
+            const minor = process.env.REF_MINOR;
+            const patch = process.env.REF_PATCH;
+            const revision = process.env.REF_REVISION;
+            const cascadeResult = process.env.CASCADE_RESULT;
+
+            const lines = [
+              `## Cascade Summary`,
+              '',
+              `**Trigger:** \`${tag}\` (${type})`,
+              `**Version:** ${major}.${minor}.${patch}${revision ? `-rev.${revision}` : ''}`,
+              ''
+            ];
+
+            let targets = [];
+            try { targets = JSON.parse(process.env.TARGETS_JSON || '[]'); } catch {}
+
+            if (type === 'rc') {
+              lines.push(`### No Cascade`);
+              lines.push(`RC tags do not trigger cascade. Wait for promotion or revision.`);
+            } else if (targets.length > 0) {
+              lines.push(`### Cascade Targets`);
+              lines.push('');
+              
+              // Add context for revision triggers
+              if (type === 'revision') {
+                for (const t of targets) {
+                  if (t.patch > parseInt(patch)) {
+                    lines.push(`> **Revision cascades to higher patch**: \`${tag}\` is a revision of \`v${major}.${minor}.${patch}\`,`);
+                    lines.push(`> but patch \`${t.tag}\` already exists. The revision content will be merged into`);
+                    lines.push(`> \`release/${t.major}.${t.minor}.${t.patch}-rev\`, producing a **revision RC** of \`${t.tag}\`.`);
+                    lines.push('');
+                  }
+                }
+              }
+
+              lines.push(`| Target Branch | From Tag | Status |`);
+              lines.push(`|---------------|----------|--------|`);
+              for (const t of targets) {
+                const refPatch = parseInt(patch);
+                const branchSuffix = (type === 'revision' && t.patch > refPatch) ? `.${t.patch}-rev` : '';
+                lines.push(`| \`release/${t.major}.${t.minor}${branchSuffix}\` | \`${t.tag}\` | ${cascadeResult} |`);
+              }
+              lines.push('');
+              lines.push(`> Release workflow will compute version and create appropriate tag.`);
+              lines.push(`> New tags will re-trigger this workflow for further cascading.`);
+            } else {
+              lines.push(`### No Cascade Targets`);
+              lines.push(`No versions found to cascade to. End of cascade chain.`);
+            }
+
+            lines.push('');
+            lines.push(`### Job Status`);
+            lines.push(`- Parse trigger: ${{ needs.parse-trigger.result }}`);
+            lines.push(`- Find targets: ${{ needs.find-cascade-targets.result }}`);
+            lines.push(`- Cascade: ${cascadeResult}`);
+
+            const summary = lines.join('\n');
+            console.log(summary);
+
+            await core.summary.addRaw(summary).write();
+
+
