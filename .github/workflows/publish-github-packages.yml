@@ -1,4 +1,4 @@
-name: publish to github packages (npm)
+name: 📦 publish to github packages (npm)
 
 on:
   workflow_dispatch:
@@ -35,12 +35,11 @@ jobs:
 
       - name: install deps
         run: |
-          npm install -g lerna
           yarn install --frozen-lockfile
 
       - name: build
         run: |
-          lerna run build
+          npx lerna@6.5.1 run build
 
       - name: publish (github packages)
         if: ${{ github.event.inputs.dry_run != 'true' }}
@@ -49,4 +48,4 @@ jobs:
         run: |
           npm config set registry https://npm.pkg.github.com
           npm whoami || true
-          lerna publish from-package --yes --no-push
+          npx lerna@6.5.1 publish from-package --yes --no-push
